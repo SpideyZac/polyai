@@ -1,0 +1,5 @@
+[language-server.clangd]
+args = [
+  "--compile-commands-dir=./build/intellisense",
+  "--experimental-modules-support",
+]
