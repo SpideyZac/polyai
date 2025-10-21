@@ -36,4 +36,7 @@ clean:
 build-intellisense:
 	cmake -S . -B $(BUILD_DIR)/intellisense -G Ninja $(CMAKE_BUILD_INTELLISENSE_FLAGS)
 
+check-intellisense: build-intellisense
+	cmake --build $(BUILD_DIR)/intellisense
+
 .PHONY: all run clean build-intellisense
