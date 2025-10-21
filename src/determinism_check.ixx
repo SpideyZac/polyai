@@ -1,4 +1,5 @@
 module;
+#include <algorithm>
 #include <iostream>
 #include <memory>
 
