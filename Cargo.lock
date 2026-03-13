@@ -1098,6 +1098,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "pyo3",
+ "thiserror 2.0.18",
  "wasmtime",
 ]
 
