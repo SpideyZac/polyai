@@ -1,3 +1,0 @@
-[submodule "simulation_worker/wasmtime"]
-	path = simulation_worker/wasmtime
-	url = https://github.com/bytecodealliance/wasmtime.git
