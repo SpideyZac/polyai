@@ -1,12 +1,17 @@
 //! PolyTrack Physics WASM Host Runtime
 
-use std::{
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pyo3::pymodule;
-use wasmtime::{Caller, Engine, Extern, Instance, Linker, Memory, Module, Store, TypedFunc, bail};
+use wasmtime::{
+    Caller, Engine, Extern, Instance, Linker, Memory, Module, Store, TypedFunc, bail, format_err,
+};
+
+/// Size of the pre-allocated scratch buffer inside the WASM heap (bytes).
+///
+/// Any `alloc_bytes` call whose payload fits within this size reuses the
+/// single persistent allocation instead of calling `malloc`/`free`.
+const SCRATCH_BUF_SIZE: usize = 64 * 1024; // 64 KiB
 
 /// Errors that can occur while executing the physics simulation.
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +23,14 @@ pub enum PhysicsError {
     #[error("wasm module exited with code {0}")]
     WasmExited(i32),
 
+    /// A host-side bounds check on WASM linear memory failed.
+    #[error("out-of-bounds wasm memory access: offset {offset} + len {len} > heap size {heap}")]
+    OutOfBounds {
+        offset: usize,
+        len: usize,
+        heap: usize,
+    },
+
     /// Any runtime error originating from Wasmtime.
     #[error("wasm error: {0}")]
     Wasm(#[from] wasmtime::Error),
@@ -25,17 +38,10 @@ pub enum PhysicsError {
 
 /// Shared runtime state used by host import functions.
 ///
-/// The WASM module writes to file descriptors `1` (stdout) and
-/// `2` (stderr). These buffers accumulate output until a newline
-/// is encountered, at which point the line is flushed to the host.
+/// WASM execution is inherently single-threaded — one `Store` is never
+/// shared across threads — so no `Arc<Mutex<>>` wrapper is needed here.
 #[derive(Default)]
 struct HostState {
-    /// Buffered stdout output.
-    stdout_buf: Vec<u8>,
-
-    /// Buffered stderr output.
-    stderr_buf: Vec<u8>,
-
     /// Indicates whether the WASM module has exited.
     exited: bool,
 
@@ -47,19 +53,6 @@ impl HostState {
     /// Returns the exit code if the module has exited.
     fn check_exit(&self) -> Option<i32> {
         self.exited.then_some(self.exit_code)
-    }
-
-    /// Returns the buffer associated with a file descriptor.
-    ///
-    /// Supported descriptors:
-    /// - `1` → stdout
-    /// - `2` → stderr
-    fn fd_buf(&mut self, fd: i32) -> Option<&mut Vec<u8>> {
-        match fd {
-            1 => Some(&mut self.stdout_buf),
-            2 => Some(&mut self.stderr_buf),
-            _ => None,
-        }
     }
 }
 
@@ -144,12 +137,22 @@ struct Exports {
 ///
 /// Each instance owns a fully isolated simulation environment.
 pub struct PolyTrackPhysics {
-    /// Shared host state accessible to import functions.
-    store: Store<Arc<Mutex<HostState>>>,
+    /// Host state (exit flags, etc.) stored directly in the `Store`.
+    ///
+    /// WASM execution via Wasmtime is single-threaded, so no `Arc<Mutex<>>`
+    /// wrapper is needed.
+    store: Store<HostState>,
+
     /// The instantiated WASM module.
     instance: Instance,
+
     /// Cached exports for efficient access.
     exports: Exports,
+
+    /// Pointer to a persistent `SCRATCH_BUF_SIZE`-byte allocation inside the
+    /// WASM heap.  Reused by `alloc_bytes` when the payload fits, avoiding a
+    /// `malloc`/`free` round-trip on every call.
+    scratch_ptr: i32,
 }
 
 impl PolyTrackPhysics {
@@ -171,9 +174,8 @@ impl PolyTrackPhysics {
 
     /// Instantiates the module and wires up all Emscripten imports.
     fn from_module(engine: Engine, module: Module) -> Result<Self, PhysicsError> {
-        let state = Arc::new(Mutex::new(HostState::default()));
-        let mut store = Store::new(&engine, state.clone());
-        let mut linker: Linker<Arc<Mutex<HostState>>> = Linker::new(&engine);
+        let mut store = Store::new(&engine, HostState::default());
+        let mut linker: Linker<HostState> = Linker::new(&engine);
 
         // all imports live under module "a" with minified single-letter names,
         // derived by cross-referencing the JS wrapper's `Y` object:
@@ -190,7 +192,7 @@ impl PolyTrackPhysics {
         linker.func_wrap(
             "a",
             "i",
-            |mut caller: Caller<'_, Arc<Mutex<HostState>>>,
+            |mut caller: Caller<'_, HostState>,
              msg: i32,
              file: i32,
              line: i32,
@@ -200,7 +202,7 @@ impl PolyTrackPhysics {
                 let file_str = read_cstr(&mut caller, file as u32);
                 let func_str = read_cstr(&mut caller, func as u32);
                 eprintln!("assertion failed: {msg_str}  at {file_str}:{line} ({func_str})");
-                mark_exited(&caller, 134); // 134 = SIGABRT
+                mark_exited(&mut caller, 134); // 134 = SIGABRT
                 bail!("assertion failed")
             },
         )?;
@@ -209,13 +211,13 @@ impl PolyTrackPhysics {
         linker.func_wrap(
             "a",
             "a",
-            |caller: Caller<'_, Arc<Mutex<HostState>>>,
+            |mut caller: Caller<'_, HostState>,
              exc: i32,
              _ty: i32,
              _dtor: i32|
              -> Result<(), wasmtime::Error> {
                 eprintln!("C++ exception thrown (ptr={exc})");
-                mark_exited(&caller, 1);
+                mark_exited(&mut caller, 1);
                 bail!("C++ exception")
             },
         )?;
@@ -223,39 +225,29 @@ impl PolyTrackPhysics {
         linker.func_wrap(
             "a",
             "e",
-            |caller: Caller<'_, Arc<Mutex<HostState>>>| -> Result<(), wasmtime::Error> {
+            |mut caller: Caller<'_, HostState>| -> Result<(), wasmtime::Error> {
                 eprintln!("abort()");
-                mark_exited(&caller, 134);
+                mark_exited(&mut caller, 134);
                 bail!("abort()")
             },
         )?;
 
-        // emscripten signals clean shutdown here; we record it but don't trap
-        // because the module may still flush output buffers afterward
-        linker.func_wrap("a", "c", |caller: Caller<'_, Arc<Mutex<HostState>>>| {
-            caller.data().lock().unwrap().exited = true;
-        })?;
+        // never called.
+        linker.func_wrap("a", "c", |_caller: Caller<'_, HostState>| {})?;
 
-        // emscripten_set_timeout schedules the internal timer callback (export "t").
-        // wat disassembly confirms "t" has no callers inside the module and is never
-        // invoked during a simulation step, so we can safely ignore it and return a
-        // dummy timer id. re-verify this if the wasm binary is ever updated.
+        // never called.
         linker.func_wrap(
             "a",
             "d",
-            |_caller: Caller<'_, Arc<Mutex<HostState>>>, _id: i32, _ms: f64| -> i32 { 0 },
+            |_caller: Caller<'_, HostState>, _id: i32, _ms: f64| -> i32 { 0 },
         )?;
 
-        linker.func_wrap(
-            "a",
-            "h",
-            |_caller: Caller<'_, Arc<Mutex<HostState>>>| -> f64 {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0)
-            },
-        )?;
+        linker.func_wrap("a", "h", |_caller: Caller<'_, HostState>| -> f64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as f64)
+                .unwrap_or(0.0)
+        })?;
 
         // emscripten_resize_heap is called when malloc needs more memory than the
         // current linear memory can hold. we grow by the minimum number of 64 KiB
@@ -263,8 +255,8 @@ impl PolyTrackPhysics {
         linker.func_wrap(
             "a",
             "f",
-            |mut caller: Caller<'_, Arc<Mutex<HostState>>>, desired: i32| -> i32 {
-                let mem = match caller.get_export("memory") {
+            |mut caller: Caller<'_, HostState>, desired: i32| -> i32 {
+                let mem = match caller.get_export("j") {
                     Some(Extern::Memory(m)) => m,
                     _ => return 0,
                 };
@@ -281,82 +273,15 @@ impl PolyTrackPhysics {
             },
         )?;
 
-        // fd_write is the WASI syscall emscripten uses for printf/puts.
-        // we line-buffer per fd so that complete log lines are printed atomically
-        // rather than character by character. unknown fds are silently dropped
-        // since the wasm module doesn't check the return value anyway.
+        // never called.
         linker.func_wrap(
             "a",
             "g",
-            |mut caller: Caller<'_, Arc<Mutex<HostState>>>,
-             fd: i32,
-             iov: i32,
-             iovcnt: i32,
-             pnum: i32|
-             -> i32 {
-                let mem = match caller.get_export("memory") {
-                    Some(Extern::Memory(m)) => m,
-                    _ => return -1,
-                };
-
-                let mut total_written: i32 = 0;
-                let state_arc = caller.data().clone();
-                let mut state = state_arc.lock().unwrap();
-
-                for i in 0..iovcnt {
-                    let base = (iov + i * 8) as usize;
-                    let data = mem.data(&caller);
-
-                    if base + 8 > data.len() {
-                        break;
-                    }
-                    let ptr = i32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
-                    let len =
-                        i32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
-
-                    if ptr + len > data.len() {
-                        break;
-                    }
-
-                    if let Some(buf) = state.fd_buf(fd) {
-                        for &byte in &data[ptr..ptr + len] {
-                            if byte == b'\n' {
-                                let line = String::from_utf8_lossy(buf).into_owned();
-                                if fd == 1 {
-                                    println!("{line}");
-                                } else {
-                                    eprintln!("{line}");
-                                }
-                                buf.clear();
-                            } else {
-                                buf.push(byte);
-                            }
-                        }
-                    }
-
-                    total_written += len as i32;
-                }
-
-                // write the total byte count back into wasm memory at *pnum as required by WASI
-                let mem_data = mem.data_mut(&mut caller);
-                if (pnum as usize + 4) <= mem_data.len() {
-                    mem_data[pnum as usize..pnum as usize + 4]
-                        .copy_from_slice(&total_written.to_le_bytes());
-                }
-
-                0
-            },
+            |mut _caller: Caller<'_, HostState>, _fd: i32, _iov: i32, _iovcnt: i32, _pnum: i32| 1,
         )?;
 
-        linker.func_wrap(
-            "a",
-            "b",
-            |caller: Caller<'_, Arc<Mutex<HostState>>>, code: i32| {
-                let mut st = caller.data().lock().unwrap();
-                st.exited = true;
-                st.exit_code = code;
-            },
-        )?;
+        // never called.
+        linker.func_wrap("a", "b", |_caller: Caller<'_, HostState>, _code: i32| {})?;
 
         let instance = linker.instantiate(&mut store, &module)?;
 
@@ -376,10 +301,12 @@ impl PolyTrackPhysics {
         //   r → _updateCarModel
         //   s → _testDeterminism
         //   t → timer callback (never invoked; see emscripten_set_timeout above)
+        //   u → stackRestore (never called; not needed for interface)
+        //   v → stackAlloc (never called; not needed for interface)
+        //   w → stackSave (never called; not needed for interface)
+        //   j → memory (never used; not needed for interface)
+        //   __indirect_function_table → functionTable (never used; not needed for interface)
         //   k → __wasm_call_ctors (called above)
-        //
-        // signatures were verified with wasm-objdump and wasm2wat — a type mismatch
-        // here surfaces immediately at instantiation rather than buried in a call
         let exports = Exports {
             malloc: instance.get_typed_func::<i32, i32>(&mut store, "l")?,
             free: instance.get_typed_func::<i32, ()>(&mut store, "m")?,
@@ -393,15 +320,24 @@ impl PolyTrackPhysics {
             test_determinism: instance.get_typed_func::<(), i32>(&mut store, "s")?,
         };
 
+        // Pre-allocate a scratch buffer. Any alloc_bytes call that fits within
+        // SCRATCH_BUF_SIZE will write directly into this region rather than
+        // calling malloc/free.
+        let scratch_ptr = exports.malloc.call(&mut store, SCRATCH_BUF_SIZE as i32)?;
+        if scratch_ptr == 0 {
+            return Err(format_err!("failed to pre-allocate scratch buffer").into());
+        }
+
         Ok(Self {
             store,
             instance,
             exports,
+            scratch_ptr,
         })
     }
 
     fn check_exited(&self) -> Result<(), PhysicsError> {
-        if let Some(code) = self.store.data().lock().unwrap().check_exit() {
+        if let Some(code) = self.store.data().check_exit() {
             return Err(PhysicsError::WasmExited(code));
         }
         Ok(())
@@ -410,27 +346,57 @@ impl PolyTrackPhysics {
     /// Returns the module's linear memory.
     fn memory(&mut self) -> Memory {
         self.instance
-            .get_memory(&mut self.store, "memory")
+            .get_memory(&mut self.store, "j")
             .expect("wasm memory export missing")
     }
 
-    /// Allocates a buffer inside the WASM heap and copies `data` into it.
+    /// Copies `data` into the WASM heap and returns a pointer to it.
     ///
-    /// The returned pointer must later be freed with [`free_wasm`].
-    pub fn alloc_bytes(&mut self, data: &[u8]) -> Result<i32, PhysicsError> {
+    /// If `data` fits within `SCRATCH_BUF_SIZE`, the pre-allocated scratch
+    /// buffer is reused and `is_scratch` is `true`; the caller must **not**
+    /// free the pointer in that case.  For larger payloads a fresh `malloc`
+    /// allocation is made (`is_scratch = false`) and the caller is responsible
+    /// for freeing it with [`free_wasm`].
+    ///
+    /// Returns `(ptr, is_scratch)`.
+    pub fn alloc_bytes(&mut self, data: &[u8]) -> Result<(i32, bool), PhysicsError> {
         self.check_exited()?;
-        let ptr = self
-            .exports
-            .malloc
-            .call(&mut self.store, data.len() as i32)?;
-        // re-fetch memory after malloc since the call may have grown the heap
+
+        let (ptr, is_scratch) = if data.len() <= SCRATCH_BUF_SIZE {
+            (self.scratch_ptr, true)
+        } else {
+            let p = self
+                .exports
+                .malloc
+                .call(&mut self.store, data.len() as i32)?;
+            (p, false)
+        };
+
+        // Bounds-check before writing: re-fetch memory since malloc may have
+        // grown the heap.
         let mem = self.memory();
-        mem.data_mut(&mut self.store)[ptr as usize..ptr as usize + data.len()]
-            .copy_from_slice(data);
-        Ok(ptr)
+        let heap_size = mem.data_size(&self.store);
+        let offset = ptr as usize;
+        if offset
+            .checked_add(data.len())
+            .is_none_or(|end| end > heap_size)
+        {
+            return Err(PhysicsError::OutOfBounds {
+                offset,
+                len: data.len(),
+                heap: heap_size,
+            });
+        }
+
+        mem.data_mut(&mut self.store)[offset..offset + data.len()].copy_from_slice(data);
+        Ok((ptr, is_scratch))
     }
 
     /// Frees a previously allocated WASM buffer.
+    ///
+    /// Do **not** call this for pointers obtained from `alloc_bytes` when
+    /// `is_scratch` was `true` — the scratch buffer is owned by the runtime
+    /// and freed in `Drop`.
     pub fn free_wasm(&mut self, ptr: i32) -> Result<(), PhysicsError> {
         self.check_exited()?;
         self.exports.free.call(&mut self.store, ptr)?;
@@ -438,9 +404,20 @@ impl PolyTrackPhysics {
     }
 
     /// Reads `len` bytes from wasm linear memory starting at `ptr`.
-    pub fn read_wasm(&mut self, ptr: i32, len: usize) -> Vec<u8> {
+    pub fn read_wasm(&mut self, ptr: i32, len: usize) -> Result<Vec<u8>, PhysicsError> {
         let mem = self.memory();
-        mem.data(&self.store)[ptr as usize..ptr as usize + len].to_vec()
+        let heap_size = mem.data_size(&self.store);
+        let offset = ptr as usize;
+
+        if offset.checked_add(len).is_none_or(|end| end > heap_size) {
+            return Err(PhysicsError::OutOfBounds {
+                offset,
+                len,
+                heap: heap_size,
+            });
+        }
+
+        Ok(mem.data(&self.store)[offset..offset + len].to_vec())
     }
 
     /// Initializes a car collision shape with the given parameters.
@@ -502,18 +479,29 @@ impl PolyTrackPhysics {
 
     /// Checks if the WASM module has exited.
     pub fn has_exited(&self) -> bool {
-        self.store.data().lock().unwrap().exited
+        self.store.data().exited
     }
 
     /// If the module has exited, returns the recorded exit code.
     pub fn exit_code(&self) -> Option<i32> {
-        self.store.data().lock().unwrap().check_exit()
+        self.store.data().check_exit()
+    }
+}
+
+impl Drop for PolyTrackPhysics {
+    /// Releases the pre-allocated scratch buffer back to the WASM heap.
+    ///
+    /// Skipped if the module has already exited, since the heap is gone.
+    fn drop(&mut self) {
+        if !self.has_exited() {
+            let _ = self.exports.free.call(&mut self.store, self.scratch_ptr);
+        }
     }
 }
 
 /// Reads a null-terminated C string from WASM memory.
-fn read_cstr(caller: &mut Caller<'_, Arc<Mutex<HostState>>>, ptr: u32) -> String {
-    let mem = match caller.get_export("memory") {
+fn read_cstr(caller: &mut Caller<'_, HostState>, ptr: u32) -> String {
+    let mem = match caller.get_export("j") {
         Some(Extern::Memory(m)) => m,
         _ => return "<no memory>".into(),
     };
@@ -528,8 +516,8 @@ fn read_cstr(caller: &mut Caller<'_, Arc<Mutex<HostState>>>, ptr: u32) -> String
 }
 
 /// Marks the module as exited with the given code.
-fn mark_exited(caller: &Caller<'_, Arc<Mutex<HostState>>>, code: i32) {
-    let mut st = caller.data().lock().unwrap();
+fn mark_exited(caller: &mut Caller<'_, HostState>, code: i32) {
+    let st = caller.data_mut();
     st.exited = true;
     st.exit_code = code;
 }
