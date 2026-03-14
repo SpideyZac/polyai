@@ -300,11 +300,11 @@ impl PolyTrackPhysics {
         //   q → _deleteCarModel
         //   r → _updateCarModel
         //   s → _testDeterminism
-        //   t → timer callback (never invoked; see emscripten_set_timeout above)
+        //   t → timer callback (never called; not needed for interface)
         //   u → stackRestore (never called; not needed for interface)
         //   v → stackAlloc (never called; not needed for interface)
         //   w → stackSave (never called; not needed for interface)
-        //   j → memory (never used; not needed for interface)
+        //   j → memory (used for raw memory access in host functions)
         //   __indirect_function_table → functionTable (never used; not needed for interface)
         //   k → __wasm_call_ctors (called above)
         let exports = Exports {
