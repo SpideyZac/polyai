@@ -1,7 +1,5 @@
 //! PolyTrack Physics WASM Host Runtime
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use pyo3::pymodule;
 use wasmtime::{
     Caller, Engine, Extern, Instance, Linker, Memory, Module, Store, TypedFunc, bail, format_err,
@@ -242,12 +240,9 @@ impl PolyTrackPhysics {
             |_caller: Caller<'_, HostState>, _id: i32, _ms: f64| -> i32 { 0 },
         )?;
 
-        linker.func_wrap("a", "h", |_caller: Caller<'_, HostState>| -> f64 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0)
-        })?;
+        // technically used in the WASM, but the original C++ code never grabs the current time.
+        // seems as emscripten is calling it internally for some reason.
+        linker.func_wrap("a", "h", |_caller: Caller<'_, HostState>| -> f64 { 0.0 })?;
 
         // emscripten_resize_heap is called when malloc needs more memory than the
         // current linear memory can hold. we grow by the minimum number of 64 KiB
