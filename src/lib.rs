@@ -1,5 +1,3 @@
-//! Simulation Worker ported to Rust and exposed as a Python module via PyO3.
-
 mod data_reader;
 mod physics_worker;
 mod simulation;
@@ -18,7 +16,6 @@ fn engine() -> &'static Engine {
     ENGINE.get_or_init(create_engine)
 }
 
-/// Python bindings for the simulation runtime.
 #[pymodule]
 pub mod simulation_worker {
     use pyo3::{PyResult, exceptions::PyRuntimeError, pyclass, pymethods};
@@ -75,6 +72,12 @@ pub mod simulation_worker {
             self.simulation.determinism_test().map_err(|e| {
                 PyRuntimeError::new_err(format!("Failed to run determinism test: {e}"))
             })
+        }
+
+        fn create_car(&mut self, export_string: String, car_id: u32) -> PyResult<()> {
+            self.simulation
+                .create_car(&export_string, car_id)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create car: {e}")))
         }
     }
 

@@ -3,6 +3,7 @@
 
 import builtins
 import typing
+
 __all__ = [
     "SimulationWorkerPy",
 ]
@@ -12,4 +13,4 @@ class SimulationWorkerPy:
     def __new__(cls) -> SimulationWorkerPy: ...
     def init(self) -> None: ...
     def test_determinism(self) -> builtins.bool: ...
-
+    def create_car(self, export_string: builtins.str, car_id: builtins.int) -> None: ...
