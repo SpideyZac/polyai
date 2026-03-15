@@ -267,7 +267,7 @@ pub struct Exports {
     pub _create_car_model: TypedFunc<CreateCarModelArgs, ()>,
     pub _delete_car_model: TypedFunc<i32, ()>,
     pub _update_car_model: TypedFunc<UpdateCarModelArgs, ()>,
-    pub _test_determinism: TypedFunc<(), i32>,
+    pub test_determinism: TypedFunc<(), i32>,
 }
 
 /// An isolated instance of the PolyTrack physics simulation.
@@ -320,7 +320,7 @@ impl PolyTrackPhysics {
     /// re-compiling the bytecode.
     pub fn from_file(engine: &Engine, wasm_path: &str) -> Result<(Self, Module), PhysicsError> {
         let module = Module::from_file(engine, wasm_path)?;
-        Ok((Self::from_module(engine, module.clone())?, module))
+        Ok((Self::from_module(engine, &module)?, module))
     }
 
     /// Instantiates the module and wires up all Emscripten host imports.
@@ -346,7 +346,7 @@ impl PolyTrackPhysics {
     /// After linking, `__wasm_call_ctors` (`"k"`) is invoked to run C++ static
     /// constructors and complete Emscripten runtime initialisation — equivalent
     /// to what the JS wrapper does immediately after `WebAssembly.instantiate`.
-    pub fn from_module(engine: &Engine, module: Module) -> Result<Self, PhysicsError> {
+    pub fn from_module(engine: &Engine, module: &Module) -> Result<Self, PhysicsError> {
         let state = HostState {
             exited: false,
             exit_code: 0,
@@ -471,7 +471,7 @@ impl PolyTrackPhysics {
         // `exit(code)` — likewise never called at runtime for this module.
         linker.func_wrap("a", "b", |_caller: Caller<'_, HostState>, _code: i32| {})?;
 
-        let instance = linker.instantiate(&mut store, &module)?;
+        let instance = linker.instantiate(&mut store, module)?;
 
         // Run C++ static constructors and Emscripten internal initialisation.
         // The JS wrapper does this immediately after instantiation; skipping it
@@ -492,7 +492,7 @@ impl PolyTrackPhysics {
             _delete_car_model: instance.get_typed_func::<i32, ()>(&mut store, "q")?,
             _update_car_model: instance
                 .get_typed_func::<UpdateCarModelArgs, ()>(&mut store, "r")?,
-            _test_determinism: instance.get_typed_func::<(), i32>(&mut store, "s")?,
+            test_determinism: instance.get_typed_func::<(), i32>(&mut store, "s")?,
         };
 
         // Pre-allocate the scratch buffer.  We request SCRATCH_BUF_SIZE + 16
@@ -699,7 +699,7 @@ impl PolyTrackPhysics {
 
     /// Returns the exit code recorded when the module terminated, or `None` if
     /// it is still running.
-    pub fn exit_code(&self) -> Option<i32> {
+    pub fn _exit_code(&self) -> Option<i32> {
         self.store.data().check_exit()
     }
 }

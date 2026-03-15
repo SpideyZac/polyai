@@ -5,13 +5,13 @@ use crate::{
     physics_worker::{Exports, PolyTrackPhysics},
 };
 
-pub struct SimulationWorker<'a> {
-    physics: &'a mut PolyTrackPhysics,
+pub struct SimulationWorker {
+    physics: PolyTrackPhysics,
     exports: Exports,
 }
 
-impl<'a> SimulationWorker<'a> {
-    pub fn new(physics: &'a mut PolyTrackPhysics) -> Self {
+impl SimulationWorker {
+    pub fn new(physics: PolyTrackPhysics) -> Self {
         let exports = physics.exports();
         Self { physics, exports }
     }
@@ -64,5 +64,10 @@ impl<'a> SimulationWorker<'a> {
         }
 
         Ok(())
+    }
+
+    pub fn determinism_test(&mut self) -> anyhow::Result<bool> {
+        let result = self.physics.call(&self.exports.test_determinism, ())?;
+        Ok(result != 0)
     }
 }

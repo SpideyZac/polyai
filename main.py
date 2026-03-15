@@ -1,3 +1,5 @@
 import simulation_worker
 
-print(simulation_worker.test())
+simworker = simulation_worker.SimulationWorkerPy()
+simworker.init()
+print(simworker.test_determinism())
