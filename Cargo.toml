@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0.102"
+bytemuck = "1.25.0"
 pyo3 = { git = "https://github.com/pyo3/pyo3", version = "0.28.2" }
 thiserror = "2.0.18"
 wasmtime = "42.0.1"

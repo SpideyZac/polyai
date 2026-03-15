@@ -36,7 +36,7 @@ use std::num::NonZeroI32;
 
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, OptLevel, Store, StoreLimits,
-    StoreLimitsBuilder, TypedFunc, WasmTy, bail, format_err,
+    StoreLimitsBuilder, TypedFunc, WasmParams, WasmResults, bail, format_err,
 };
 
 /// Size of the pre-allocated scratch buffer inside the WASM heap (bytes).
@@ -73,7 +73,7 @@ const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// than a legitimately expensive computation.
 ///
 /// See [`PolyTrackPhysics::reset_fuel`] if you need to replenish mid-run.
-const INITIAL_FUEL: u64 = 10_000_000;
+pub const INITIAL_FUEL: u64 = 10_000_000;
 
 /// Exit code used when the WASM module calls `abort()` or fails an assertion.
 ///
@@ -288,15 +288,16 @@ pub type UpdateCarModelArgs = (i32, i32, i32, i32, i32, i32, i32);
 /// s → _testDeterminism
 /// j → memory  (linear memory, not a function)
 /// ```
-struct Exports {
-    malloc: TypedFunc<i32, i32>,
-    free: TypedFunc<i32, ()>,
-    init_car_collision_shape: TypedFunc<InitCarCollisionShapeArgs, ()>,
-    add_track_part_config: TypedFunc<AddTrackPartConfigArgs, ()>,
-    create_car_model: TypedFunc<CreateCarModelArgs, ()>,
-    delete_car_model: TypedFunc<i32, ()>,
-    update_car_model: TypedFunc<UpdateCarModelArgs, ()>,
-    test_determinism: TypedFunc<(), i32>,
+#[derive(Clone)]
+pub struct Exports {
+    pub malloc: TypedFunc<i32, i32>,
+    pub free: TypedFunc<i32, ()>,
+    pub init_car_collision_shape: TypedFunc<InitCarCollisionShapeArgs, ()>,
+    pub add_track_part_config: TypedFunc<AddTrackPartConfigArgs, ()>,
+    pub _create_car_model: TypedFunc<CreateCarModelArgs, ()>,
+    pub _delete_car_model: TypedFunc<i32, ()>,
+    pub _update_car_model: TypedFunc<UpdateCarModelArgs, ()>,
+    pub _test_determinism: TypedFunc<(), i32>,
 }
 
 /// An isolated instance of the PolyTrack physics simulation.
@@ -375,7 +376,7 @@ impl PolyTrackPhysics {
     /// After linking, `__wasm_call_ctors` (`"k"`) is invoked to run C++ static
     /// constructors and complete Emscripten runtime initialisation — equivalent
     /// to what the JS wrapper does immediately after `WebAssembly.instantiate`.
-    fn from_module(engine: &Engine, module: Module) -> Result<Self, PhysicsError> {
+    pub fn from_module(engine: &Engine, module: Module) -> Result<Self, PhysicsError> {
         let state = HostState {
             exited: false,
             exit_code: 0,
@@ -517,10 +518,12 @@ impl PolyTrackPhysics {
                 .get_typed_func::<InitCarCollisionShapeArgs, ()>(&mut store, "n")?,
             add_track_part_config: instance
                 .get_typed_func::<AddTrackPartConfigArgs, ()>(&mut store, "o")?,
-            create_car_model: instance.get_typed_func::<CreateCarModelArgs, ()>(&mut store, "p")?,
-            delete_car_model: instance.get_typed_func::<i32, ()>(&mut store, "q")?,
-            update_car_model: instance.get_typed_func::<UpdateCarModelArgs, ()>(&mut store, "r")?,
-            test_determinism: instance.get_typed_func::<(), i32>(&mut store, "s")?,
+            _create_car_model: instance
+                .get_typed_func::<CreateCarModelArgs, ()>(&mut store, "p")?,
+            _delete_car_model: instance.get_typed_func::<i32, ()>(&mut store, "q")?,
+            _update_car_model: instance
+                .get_typed_func::<UpdateCarModelArgs, ()>(&mut store, "r")?,
+            _test_determinism: instance.get_typed_func::<(), i32>(&mut store, "s")?,
         };
 
         // Pre-allocate the scratch buffer.  We request SCRATCH_BUF_SIZE + 16
@@ -636,7 +639,7 @@ impl PolyTrackPhysics {
     /// Performs a host-side bounds check before returning the slice.  The check
     /// is against the current heap size, which may have grown since the pointer
     /// was allocated.
-    pub fn wasm_slice(&self, ptr: i32, len: usize) -> Result<&[u8], PhysicsError> {
+    pub fn _wasm_slice(&self, ptr: i32, len: usize) -> Result<&[u8], PhysicsError> {
         let heap_size = self.memory.data(&self.store).len();
         let offset = ptr as usize;
 
@@ -654,7 +657,7 @@ impl PolyTrackPhysics {
     /// Returns a mutable view into WASM linear memory at `[ptr, ptr+len)`.
     ///
     /// See [`wasm_slice`] for bounds-checking behaviour.
-    pub fn wasm_slice_mut(&mut self, ptr: i32, len: usize) -> Result<&mut [u8], PhysicsError> {
+    pub fn _wasm_slice_mut(&mut self, ptr: i32, len: usize) -> Result<&mut [u8], PhysicsError> {
         let heap_size = self.memory.data(&self.store).len();
         let offset = ptr as usize;
 
@@ -674,7 +677,7 @@ impl PolyTrackPhysics {
     ///
     /// Prefer [`wasm_slice`] when a borrow is sufficient; this method allocates
     /// and copies.
-    pub fn read_wasm(&mut self, ptr: i32, len: usize) -> Result<Vec<u8>, PhysicsError> {
+    pub fn _read_wasm(&mut self, ptr: i32, len: usize) -> Result<Vec<u8>, PhysicsError> {
         let heap_size = self.memory.data(&self.store).len();
         let offset = ptr as usize;
 
@@ -689,6 +692,14 @@ impl PolyTrackPhysics {
         Ok(self.memory.data(&self.store)[offset..offset + len].to_vec())
     }
 
+    /// Returns a reference to the cached WASM export handles.
+    ///
+    /// Clones the [`Exports`] struct so that callers can hold onto the function handles without needing to borrow the entire [`PolyTrackPhysics`] instance.
+    /// The result should be a long-lived struct to reduce the overhead of cloning, but cloning is cheap since it only contains [`TypedFunc`] handles which are internally reference-counted.
+    pub fn exports(&self) -> Exports {
+        self.exports.clone()
+    }
+
     /// Calls a typed WASM function, translating Wasmtime errors into
     /// [`PhysicsError`] variants.
     ///
@@ -699,8 +710,8 @@ impl PolyTrackPhysics {
     /// `Err(WasmExited(...))`.
     pub fn call<T, R>(&mut self, f: &TypedFunc<T, R>, args: T) -> Result<R, PhysicsError>
     where
-        T: WasmTy,
-        R: WasmTy,
+        T: WasmParams,
+        R: WasmResults,
     {
         self.check_exited()?;
         let result = match f.call(&mut self.store, args) {
