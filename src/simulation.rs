@@ -2,7 +2,7 @@ use bytemuck::cast_slice;
 
 use crate::{
     data_reader::{Detector, assets},
-    physics_worker::{Exports, INITIAL_FUEL, PolyTrackPhysics},
+    physics_worker::{Exports, PolyTrackPhysics},
 };
 
 pub struct SimulationWorker<'a> {
@@ -17,7 +17,6 @@ impl<'a> SimulationWorker<'a> {
     }
 
     pub fn init(&mut self) -> anyhow::Result<()> {
-        self.physics.reset_fuel(INITIAL_FUEL)?;
         let assets = assets();
         let vertices_ptr = self
             .physics
@@ -35,7 +34,6 @@ impl<'a> SimulationWorker<'a> {
         self.physics.free_wasm(vertices_ptr)?;
 
         for part in assets.track_parts.iter() {
-            self.physics.reset_fuel(INITIAL_FUEL * 4)?;
             let part_verticies_ptr = self.physics.alloc_bytes(cast_slice(&part.vertices))?;
 
             let detector_default = Detector::default();

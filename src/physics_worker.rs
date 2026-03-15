@@ -24,13 +24,6 @@
 //! │  └──────────────────────────────────────┘ │
 //! └──────────────────────────────────────────┘
 //! ```
-//!
-//! # Fuel
-//!
-//! Wasmtime's *fuel* mechanism lets us bound how long the module runs.  Each
-//! WASM instruction burns one unit of fuel; when the tank hits zero Wasmtime
-//! traps.  We start with 10 million units (see [`PolyTrackPhysics::from_module`])
-//! and surface that trap as [`PhysicsError::OutOfFuel`].
 
 use std::num::NonZeroI32;
 
@@ -65,16 +58,6 @@ const SCRATCH_BUF_ALIGN_PADDING: usize = 16;
 /// than a few MiB; 64 MiB is generous headroom without risking runaway growth.
 const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Initial fuel budget for a single [`PolyTrackPhysics`] instance.
-///
-/// Wasmtime burns one unit per WASM instruction.  10 million units is
-/// enough for a full simulation step with headroom to spare; hitting this
-/// limit almost certainly indicates an infinite loop or a logic bug rather
-/// than a legitimately expensive computation.
-///
-/// See [`PolyTrackPhysics::reset_fuel`] if you need to replenish mid-run.
-pub const INITIAL_FUEL: u64 = 10_000_000;
-
 /// Exit code used when the WASM module calls `abort()` or fails an assertion.
 ///
 /// Mirrors the Unix convention where SIGABRT (signal 6) produces exit status
@@ -84,9 +67,6 @@ const EXIT_CODE_ABORT: i32 = 134;
 /// Creates a Wasmtime [`Engine`] configured for the physics module.
 ///
 /// Settings chosen here:
-/// - **Fuel metering** — lets callers cap execution time by limiting the number
-///   of WASM instructions executed.  Without this an infinite loop in the
-///   physics code would hang the process.
 /// - **Cranelift `Speed` optimisation** — the physics hot loop is CPU-bound, so
 ///   we pay the slightly longer compile time upfront for faster steady-state
 ///   throughput.
@@ -98,7 +78,6 @@ const EXIT_CODE_ABORT: i32 = 134;
 pub fn create_engine() -> Engine {
     let mut config = Config::new();
 
-    config.consume_fuel(true);
     config.cranelift_opt_level(OptLevel::Speed);
     config.wasm_simd(true);
 
@@ -174,15 +153,6 @@ pub enum PhysicsError {
         len: usize,
         heap: usize,
     },
-
-    /// The module executed more WASM instructions than the configured fuel
-    /// budget allows.
-    ///
-    /// The caller can recover by calling [`PolyTrackPhysics::reset_fuel`] if
-    /// partial progress is acceptable, or treat this as a fatal error if
-    /// determinism is required.
-    #[error("wasm ran out of fuel")]
-    OutOfFuel,
 
     /// Any other runtime error from Wasmtime (trap, link error, etc.).
     #[error("wasm error: {0}")]
@@ -386,7 +356,6 @@ impl PolyTrackPhysics {
         };
         let mut store = Store::new(engine, state);
         store.limiter(|state| &mut state.limits);
-        store.set_fuel(INITIAL_FUEL)?;
         let mut linker: Linker<HostState> = Linker::new(engine);
 
         // `__assert_fail(msg, file, line, func)` — print the assertion message
@@ -714,17 +683,7 @@ impl PolyTrackPhysics {
         R: WasmResults,
     {
         self.check_exited()?;
-        let result = match f.call(&mut self.store, args) {
-            Ok(v) => v,
-            Err(e) => {
-                // Wasmtime surfaces fuel exhaustion as a generic error message
-                // rather than a dedicated type, so we match on the string.
-                if e.to_string().contains("all fuel consumed") {
-                    return Err(PhysicsError::OutOfFuel);
-                }
-                return Err(e.into());
-            }
-        };
+        let result = f.call(&mut self.store, args)?;
         self.check_exited()?;
         Ok(result)
     }
@@ -742,17 +701,6 @@ impl PolyTrackPhysics {
     /// it is still running.
     pub fn exit_code(&self) -> Option<i32> {
         self.store.data().check_exit()
-    }
-
-    /// Replenishes the fuel tank to `fuel` units, allowing execution to
-    /// continue after a [`PhysicsError::OutOfFuel`] error.
-    ///
-    /// Use this only when partial progress is acceptable.  If the simulation
-    /// must be deterministic, hitting the fuel limit likely indicates a bug —
-    /// reset the instance entirely rather than re-fueling.
-    pub fn reset_fuel(&mut self, fuel: u64) -> Result<(), PhysicsError> {
-        self.store.set_fuel(fuel)?;
-        Ok(())
     }
 }
 
