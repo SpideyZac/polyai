@@ -88,8 +88,8 @@ pub struct Exports {
     pub init_car_collision_shape: TypedFunc<InitCarCollisionShapeArgs, ()>,
     pub add_track_part_config: TypedFunc<AddTrackPartConfigArgs, ()>,
     pub create_car_model: TypedFunc<CreateCarModelArgs, ()>,
-    pub _delete_car_model: TypedFunc<i32, ()>,
-    pub _update_car_model: TypedFunc<UpdateCarModelArgs, ()>,
+    pub delete_car_model: TypedFunc<i32, ()>,
+    pub update_car_model: TypedFunc<UpdateCarModelArgs, ()>,
     pub test_determinism: TypedFunc<(), i32>,
 }
 
@@ -213,9 +213,8 @@ impl PolyTrackPhysics {
             add_track_part_config: instance
                 .get_typed_func::<AddTrackPartConfigArgs, ()>(&mut store, "o")?,
             create_car_model: instance.get_typed_func::<CreateCarModelArgs, ()>(&mut store, "p")?,
-            _delete_car_model: instance.get_typed_func::<i32, ()>(&mut store, "q")?,
-            _update_car_model: instance
-                .get_typed_func::<UpdateCarModelArgs, ()>(&mut store, "r")?,
+            delete_car_model: instance.get_typed_func::<i32, ()>(&mut store, "q")?,
+            update_car_model: instance.get_typed_func::<UpdateCarModelArgs, ()>(&mut store, "r")?,
             test_determinism: instance.get_typed_func::<(), i32>(&mut store, "s")?,
         };
 
@@ -274,7 +273,7 @@ impl PolyTrackPhysics {
         self.check_exited()
     }
 
-    pub fn _wasm_slice(&self, ptr: i32, len: usize) -> Result<&[u8], PhysicsError> {
+    pub fn wasm_slice(&self, ptr: i32, len: usize) -> Result<&[u8], PhysicsError> {
         let heap_size = self.memory.data(&self.store).len();
         let offset = ptr as usize;
 
@@ -287,36 +286,6 @@ impl PolyTrackPhysics {
         }
 
         Ok(&self.memory.data(&self.store)[offset..offset + len])
-    }
-
-    pub fn _wasm_slice_mut(&mut self, ptr: i32, len: usize) -> Result<&mut [u8], PhysicsError> {
-        let heap_size = self.memory.data(&self.store).len();
-        let offset = ptr as usize;
-
-        if offset.checked_add(len).is_none_or(|end| end > heap_size) {
-            return Err(PhysicsError::OutOfBounds {
-                offset,
-                len,
-                heap: heap_size,
-            });
-        }
-
-        Ok(&mut self.memory.data_mut(&mut self.store)[offset..offset + len])
-    }
-
-    pub fn _read_wasm(&mut self, ptr: i32, len: usize) -> Result<Vec<u8>, PhysicsError> {
-        let heap_size = self.memory.data(&self.store).len();
-        let offset = ptr as usize;
-
-        if offset.checked_add(len).is_none_or(|end| end > heap_size) {
-            return Err(PhysicsError::OutOfBounds {
-                offset,
-                len,
-                heap: heap_size,
-            });
-        }
-
-        Ok(self.memory.data(&self.store)[offset..offset + len].to_vec())
     }
 
     pub fn exports(&self) -> Exports {
@@ -332,14 +301,6 @@ impl PolyTrackPhysics {
         let result = f.call(&mut self.store, args)?;
         self.check_exited()?;
         Ok(result)
-    }
-
-    pub fn _has_exited(&self) -> bool {
-        self.store.data().exited
-    }
-
-    pub fn _exit_code(&self) -> Option<i32> {
-        self.store.data().check_exit()
     }
 }
 

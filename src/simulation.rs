@@ -1,6 +1,6 @@
 use std::f32::consts::{PI, SQRT_2};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow, bail};
 use bytemuck::cast_slice;
 use glam::{EulerRot, Quat, Vec2, Vec3};
 use polytrack_codes::v6::{Block, Direction, TrackInfo, decode_track_code, decode_track_data};
@@ -337,34 +337,37 @@ pub struct StartTransform {
     pub quaternion: Quat,
 }
 
-struct PlayerController {
-    up: bool,
-    right: bool,
-    down: bool,
-    left: bool,
+pub struct PlayerController {
+    pub up: bool,
+    pub right: bool,
+    pub down: bool,
+    pub left: bool,
+    pub reset: bool,
 }
 
 struct Car {
     id: u32,
     controls: PlayerController,
-    has_started: bool,
-    frames: u64,
-    is_paused: bool,
 }
 
 pub struct SimulationWorker {
     physics: PolyTrackPhysics,
     exports: Exports,
     cars: Vec<Car>,
+    car_state_buffer_ptr: i32,
 }
 
 impl SimulationWorker {
-    pub fn new(physics: PolyTrackPhysics) -> Self {
+    pub fn new(mut physics: PolyTrackPhysics) -> Self {
         let exports = physics.exports();
+        let car_state_buffer_ptr = physics
+            .alloc_bytes(&vec![0u8; 227])
+            .expect("Failed to allocate car state buffer");
         Self {
             physics,
             exports,
             cars: vec![],
+            car_state_buffer_ptr,
         }
     }
 
@@ -465,13 +468,59 @@ impl SimulationWorker {
                 right: false,
                 down: false,
                 left: false,
+                reset: false,
             },
-            has_started: false,
-            frames: 0,
-            is_paused: false,
         });
 
         Ok(())
+    }
+
+    pub fn delete_car(&mut self, car_id: u32) -> anyhow::Result<()> {
+        self.physics
+            .call(&self.exports.delete_car_model, car_id as i32)?;
+        self.cars.retain(|c| c.id != car_id);
+        Ok(())
+    }
+
+    pub fn set_car_controls(
+        &mut self,
+        car_id: u32,
+        controls: PlayerController,
+    ) -> anyhow::Result<()> {
+        let car = self
+            .cars
+            .iter_mut()
+            .find(|c| c.id == car_id)
+            .ok_or_else(|| anyhow!("Car with id {car_id} not found"))?;
+
+        car.controls = controls;
+        Ok(())
+    }
+
+    pub fn update_car(&mut self, car_id: u32) -> anyhow::Result<CarState> {
+        let car = match self.cars.iter().find(|c| c.id == car_id) {
+            Some(car) => car,
+            None => {
+                eprintln!("Car with id {car_id} not found");
+                return Err(anyhow!("Car with id {car_id} not found"));
+            }
+        };
+
+        self.physics.call(
+            &self.exports.update_car_model,
+            (
+                car_id as i32,
+                car.controls.up as i32,
+                car.controls.right as i32,
+                car.controls.down as i32,
+                car.controls.left as i32,
+                car.controls.reset as i32,
+                self.car_state_buffer_ptr,
+            ),
+        )?;
+
+        let car_state_buffer = self.physics.wasm_slice(self.car_state_buffer_ptr, 227)?;
+        CarState::deserialize(car_state_buffer[4..].try_into()?)
     }
 }
 
@@ -579,5 +628,195 @@ fn calculate_start_transform(start: StartBlock<'_>, track_info: &TrackInfo) -> S
     StartTransform {
         position,
         quaternion,
+    }
+}
+
+pub struct WheelContact {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+}
+
+pub struct CarState {
+    pub frames: u32,
+    pub speed_kmh: f32,
+    pub has_started: bool,
+    pub finish_frames: Option<u32>,
+    pub next_checkpoint_index: u16,
+    pub has_checkpoint_to_respawn_at: bool,
+    pub position: [f32; 3],
+    pub quaternion: [f32; 4],
+    pub collision_impulses: Vec<f32>,
+    pub wheel_contacts: [Option<WheelContact>; 4],
+    pub wheel_suspension_lengths: [f32; 4],
+    pub wheel_suspension_velocities: [f32; 4],
+    pub wheel_delta_rotations: [f32; 4],
+    pub wheel_skid_info: [f32; 4],
+    pub steering: f32,
+    pub brake_light_enabled: bool,
+    pub controls: PlayerController,
+}
+
+impl CarState {
+    pub fn deserialize(buf: &[u8]) -> anyhow::Result<Self> {
+        let mut r = Reader::new(buf);
+
+        let frames = r.read_u24_le().context("frames")?;
+        let speed_kmh = r.read_f32_le().context("speed_kmh")?;
+
+        let flag_byte = r.read_u8().context("flag byte")?;
+        let has_started = flag_byte & 1 != 0;
+        let has_finish_frames = flag_byte & 2 != 0;
+        let has_checkpoint = flag_byte & 4 != 0;
+        let wheel_contact_present = [
+            flag_byte & 8 != 0,
+            flag_byte & 16 != 0,
+            flag_byte & 32 != 0,
+            flag_byte & 64 != 0,
+        ];
+
+        let finish_frames = if has_finish_frames {
+            Some(r.read_u24_le().context("finish_frames")?)
+        } else {
+            None
+        };
+
+        let next_checkpoint_index = r.read_u16_le().context("next_checkpoint_index")?;
+        let position = r.read_vec3().context("position")?;
+        let quaternion = r.read_vec4().context("quaternion")?;
+
+        let impulse_count = r.read_u8().context("impulse count")?;
+        if impulse_count > 4 {
+            bail!("Number of collision impulses exceeds maximum allowed");
+        }
+        let mut collision_impulses = Vec::with_capacity(impulse_count as usize);
+        for i in 0..impulse_count {
+            collision_impulses.push(
+                r.read_f32_le()
+                    .with_context(|| format!("collision_impulse[{i}]"))?,
+            );
+        }
+
+        let wheel_contacts = {
+            let mut contacts = [None, None, None, None];
+            for i in 0..4 {
+                if wheel_contact_present[i] {
+                    contacts[i] = Some(WheelContact {
+                        position: r
+                            .read_vec3()
+                            .with_context(|| format!("wheel_contact[{i}].position"))?,
+                        normal: r
+                            .read_vec3()
+                            .with_context(|| format!("wheel_contact[{i}].normal"))?,
+                    });
+                }
+            }
+            contacts
+        };
+
+        let wheel_suspension_lengths = r.read_vec4().context("wheel_suspension_lengths")?;
+        let wheel_suspension_velocities = r.read_vec4().context("wheel_suspension_velocities")?;
+        let wheel_delta_rotations = r.read_vec4().context("wheel_delta_rotations")?;
+        let wheel_skid_info = r.read_vec4().context("wheel_skid_info")?;
+
+        let steering = r.read_f32_le().context("steering")?;
+
+        let control_byte = r.read_u8().context("control byte")?;
+        let controls = PlayerController {
+            up: control_byte & 1 != 0,
+            right: control_byte & 2 != 0,
+            down: control_byte & 4 != 0,
+            left: control_byte & 8 != 0,
+            reset: control_byte & 16 != 0,
+        };
+        let brake_light_enabled = control_byte & 32 != 0;
+
+        Ok(Self {
+            frames,
+            speed_kmh,
+            has_started,
+            finish_frames,
+            next_checkpoint_index,
+            has_checkpoint_to_respawn_at: has_checkpoint,
+            position,
+            quaternion,
+            collision_impulses,
+            wheel_contacts,
+            wheel_suspension_lengths,
+            wheel_suspension_velocities,
+            wheel_delta_rotations,
+            wheel_skid_info,
+            steering,
+            brake_light_enabled,
+            controls,
+        })
+    }
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.offset)
+    }
+
+    fn require(&self, n: usize) -> anyhow::Result<()> {
+        if self.remaining() < n {
+            bail!("CarState data is too short");
+        }
+        Ok(())
+    }
+
+    fn read_u8(&mut self) -> anyhow::Result<u8> {
+        self.require(1)?;
+        let v = self.buf[self.offset];
+        self.offset += 1;
+        Ok(v)
+    }
+
+    fn read_u16_le(&mut self) -> anyhow::Result<u16> {
+        self.require(2)?;
+        let v = u16::from_le_bytes(self.buf[self.offset..self.offset + 2].try_into()?);
+        self.offset += 2;
+        Ok(v)
+    }
+
+    fn read_u24_le(&mut self) -> anyhow::Result<u32> {
+        self.require(3)?;
+        let v = self.buf[self.offset] as u32
+            | (self.buf[self.offset + 1] as u32) << 8
+            | (self.buf[self.offset + 2] as u32) << 16;
+        self.offset += 3;
+        Ok(v)
+    }
+
+    fn read_f32_le(&mut self) -> anyhow::Result<f32> {
+        self.require(4)?;
+        let v = f32::from_le_bytes(self.buf[self.offset..self.offset + 4].try_into()?);
+        self.offset += 4;
+        Ok(v)
+    }
+
+    fn read_vec3(&mut self) -> anyhow::Result<[f32; 3]> {
+        Ok([
+            self.read_f32_le()?,
+            self.read_f32_le()?,
+            self.read_f32_le()?,
+        ])
+    }
+
+    fn read_vec4(&mut self) -> anyhow::Result<[f32; 4]> {
+        Ok([
+            self.read_f32_le()?,
+            self.read_f32_le()?,
+            self.read_f32_le()?,
+            self.read_f32_le()?,
+        ])
     }
 }

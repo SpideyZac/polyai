@@ -24,7 +24,181 @@ pub mod simulation_worker {
         derive::{gen_stub_pyclass, gen_stub_pymethods},
     };
 
-    use crate::{MODULE, engine, physics_worker::PolyTrackPhysics, simulation::SimulationWorker};
+    use crate::{
+        MODULE, engine,
+        physics_worker::PolyTrackPhysics,
+        simulation::{CarState, PlayerController, SimulationWorker},
+    };
+
+    #[gen_stub_pyclass]
+    #[pyclass]
+    #[derive(Clone)]
+    pub struct PlayerControllerPy {
+        up: bool,
+        right: bool,
+        down: bool,
+        left: bool,
+        reset: bool,
+    }
+
+    #[gen_stub_pymethods]
+    #[pymethods]
+    impl PlayerControllerPy {
+        #[new]
+        fn new(up: bool, right: bool, down: bool, left: bool, reset: bool) -> Self {
+            Self {
+                up,
+                right,
+                down,
+                left,
+                reset,
+            }
+        }
+
+        fn get_up(&self) -> bool {
+            self.up
+        }
+
+        fn get_right(&self) -> bool {
+            self.right
+        }
+
+        fn get_down(&self) -> bool {
+            self.down
+        }
+
+        fn get_left(&self) -> bool {
+            self.left
+        }
+
+        fn get_reset(&self) -> bool {
+            self.reset
+        }
+    }
+
+    #[gen_stub_pyclass]
+    #[pyclass]
+    #[derive(Clone)]
+    pub struct WheelContactPy {
+        pub position: [f32; 3],
+        pub normal: [f32; 3],
+    }
+
+    #[gen_stub_pymethods]
+    #[pymethods]
+    impl WheelContactPy {
+        fn get_position(&self) -> [f32; 3] {
+            self.position
+        }
+
+        fn get_normal(&self) -> [f32; 3] {
+            self.normal
+        }
+    }
+
+    #[gen_stub_pyclass]
+    #[pyclass]
+    struct CarStatePy {
+        car_state: CarState,
+    }
+
+    #[gen_stub_pymethods]
+    #[pymethods]
+    impl CarStatePy {
+        fn get_frames(&self) -> u32 {
+            self.car_state.frames
+        }
+
+        fn get_speed_kmh(&self) -> f32 {
+            self.car_state.speed_kmh
+        }
+
+        fn get_has_started(&self) -> bool {
+            self.car_state.has_started
+        }
+
+        fn get_is_finished(&self) -> bool {
+            self.car_state.finish_frames.is_some()
+        }
+
+        fn get_finish_frames(&self) -> u32 {
+            self.car_state.finish_frames.unwrap_or(0)
+        }
+
+        fn get_next_checkpoint_index(&self) -> u16 {
+            self.car_state.next_checkpoint_index
+        }
+
+        fn get_has_checkpoint_to_respawn_at(&self) -> bool {
+            self.car_state.has_checkpoint_to_respawn_at
+        }
+
+        fn get_position(&self) -> [f32; 3] {
+            self.car_state.position
+        }
+
+        fn get_quaternion(&self) -> [f32; 4] {
+            self.car_state.quaternion
+        }
+
+        fn get_collision_impulses(&self) -> Vec<f32> {
+            self.car_state.collision_impulses.clone()
+        }
+
+        fn get_wheel_contacts(&self) -> [Option<WheelContactPy>; 4] {
+            self.car_state
+                .wheel_contacts
+                .iter()
+                .map(|contact| {
+                    contact.as_ref().map(|c| WheelContactPy {
+                        position: c.position,
+                        normal: c.normal,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Expected 4 wheel contacts, got {}",
+                        self.car_state.wheel_contacts.len()
+                    )
+                })
+        }
+
+        fn get_wheel_suspension_lengths(&self) -> [f32; 4] {
+            self.car_state.wheel_suspension_lengths
+        }
+
+        fn get_wheel_suspension_velocities(&self) -> [f32; 4] {
+            self.car_state.wheel_suspension_velocities
+        }
+
+        fn get_wheel_delta_rotations(&self) -> [f32; 4] {
+            self.car_state.wheel_delta_rotations
+        }
+
+        fn get_wheel_skid_info(&self) -> [f32; 4] {
+            self.car_state.wheel_skid_info
+        }
+
+        fn get_sterring(&self) -> f32 {
+            self.car_state.steering
+        }
+
+        fn get_brake_light_enabled(&self) -> bool {
+            self.car_state.brake_light_enabled
+        }
+
+        fn get_controls(&self) -> PlayerControllerPy {
+            PlayerControllerPy {
+                up: self.car_state.controls.up,
+                right: self.car_state.controls.right,
+                down: self.car_state.controls.down,
+                left: self.car_state.controls.left,
+                reset: self.car_state.controls.reset,
+            }
+        }
+    }
 
     #[gen_stub_pyclass]
     #[pyclass]
@@ -78,6 +252,33 @@ pub mod simulation_worker {
             self.simulation
                 .create_car(&export_string, car_id)
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create car: {e}")))
+        }
+
+        fn delete_car(&mut self, car_id: u32) -> PyResult<()> {
+            self.simulation
+                .delete_car(car_id)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete car: {e}")))
+        }
+
+        fn set_car_controls(&mut self, car_id: u32, controls: PlayerControllerPy) -> PyResult<()> {
+            let controls = PlayerController {
+                up: controls.up,
+                right: controls.right,
+                down: controls.down,
+                left: controls.left,
+                reset: controls.reset,
+            };
+            self.simulation
+                .set_car_controls(car_id, controls)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to set car controls: {e}")))
+        }
+
+        fn update_car(&mut self, car_id: u32) -> PyResult<CarStatePy> {
+            let car_state = self
+                .simulation
+                .update_car(car_id)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to update car state: {e}")))?;
+            Ok(CarStatePy { car_state })
         }
     }
 
