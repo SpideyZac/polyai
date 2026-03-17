@@ -210,7 +210,7 @@ pub mod simulation_worker {
     #[pymethods]
     impl SimulationWorkerPy {
         #[new]
-        fn new() -> PyResult<Self> {
+        fn new(export_string: String) -> PyResult<Self> {
             let engine = engine();
             let module = MODULE.get();
             let pt_physics = if let Some(module) = module {
@@ -231,7 +231,7 @@ pub mod simulation_worker {
             };
 
             let pt_physics = pt_physics;
-            let simulation = SimulationWorker::new(pt_physics);
+            let simulation = SimulationWorker::new(pt_physics, &export_string);
 
             Ok(Self { simulation })
         }
@@ -248,9 +248,9 @@ pub mod simulation_worker {
             })
         }
 
-        fn create_car(&mut self, export_string: String, car_id: u32) -> PyResult<()> {
+        fn create_car(&mut self, car_id: u32) -> PyResult<()> {
             self.simulation
-                .create_car(&export_string, car_id)
+                .create_car(car_id)
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create car: {e}")))
         }
 

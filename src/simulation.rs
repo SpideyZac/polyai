@@ -355,19 +355,50 @@ pub struct SimulationWorker {
     exports: Exports,
     cars: Vec<Car>,
     car_state_buffer_ptr: i32,
+    pub track_info: TrackInfo,
+    start: StartTransform,
+    mountain_ptr: i32,
+    track_ptr: i32,
+    part_count: i32,
+    mountain_vertices_len: i32,
+    mountain_offset: Vec3,
 }
 
 impl SimulationWorker {
-    pub fn new(mut physics: PolyTrackPhysics) -> Self {
+    pub fn new(mut physics: PolyTrackPhysics, export_string: &str) -> Self {
         let exports = physics.exports();
         let car_state_buffer_ptr = physics
             .alloc_bytes(&vec![0u8; 227])
             .expect("Failed to allocate car state buffer");
+
+        let track_info = decode_track(export_string).expect("Failed to decode track");
+        let start_block = find_start_block(&track_info).expect("Failed to find start block");
+        let start = calculate_start_transform(start_block, &track_info);
+        let mountain = build_mountain_mesh(&track_info);
+
+        let mountain_ptr = physics
+            .alloc_bytes(cast_slice(&mountain.vertices))
+            .expect("Failed to allocate mountain mesh");
+        let track_bytes = pack_track_data(&track_info);
+        let track_ptr = physics
+            .alloc_bytes(&track_bytes)
+            .expect("Failed to allocate track data");
+        let part_count = (track_bytes.len() / 19) as i32;
+        let mountain_vertices_len = mountain.vertices.len() as i32;
+        let mountain_offset = mountain.offset;
+
         Self {
             physics,
             exports,
             cars: vec![],
             car_state_buffer_ptr,
+            track_info,
+            start,
+            mountain_ptr,
+            track_ptr,
+            part_count,
+            mountain_vertices_len,
+            mountain_offset,
         }
     }
 
@@ -426,40 +457,27 @@ impl SimulationWorker {
         Ok(result != 0)
     }
 
-    pub fn create_car(&mut self, export_string: &str, car_id: u32) -> anyhow::Result<()> {
-        let track_info = decode_track(export_string)?;
-        let start_block = find_start_block(&track_info)?;
-        let start = calculate_start_transform(start_block, &track_info);
-        let mountain = build_mountain_mesh(&track_info);
-
-        let mountain_ptr = self.physics.alloc_bytes(cast_slice(&mountain.vertices))?;
-        let track_bytes = pack_track_data(&track_info);
-        let track_ptr = self.physics.alloc_bytes(&track_bytes)?;
-        let part_count = track_bytes.len() / 19;
-
+    pub fn create_car(&mut self, car_id: u32) -> anyhow::Result<()> {
         self.physics.call(
             &self.exports.create_car_model,
             (
                 car_id as i32,
-                mountain_ptr,
-                mountain.vertices.len() as i32,
-                mountain.offset.x,
-                mountain.offset.y,
-                mountain.offset.z,
-                track_ptr,
-                part_count as i32,
-                start.position.x,
-                start.position.y,
-                start.position.z,
-                start.quaternion.x,
-                start.quaternion.y,
-                start.quaternion.z,
-                start.quaternion.w,
+                self.mountain_ptr,
+                self.mountain_vertices_len,
+                self.mountain_offset.x,
+                self.mountain_offset.y,
+                self.mountain_offset.z,
+                self.track_ptr,
+                self.part_count,
+                self.start.position.x,
+                self.start.position.y,
+                self.start.position.z,
+                self.start.quaternion.x,
+                self.start.quaternion.y,
+                self.start.quaternion.z,
+                self.start.quaternion.w,
             ),
         )?;
-
-        self.physics.free_wasm(mountain_ptr)?;
-        self.physics.free_wasm(track_ptr)?;
 
         self.cars.push(Car {
             id: car_id,
@@ -567,14 +585,30 @@ fn pack_track_data(track_info: &TrackInfo) -> Vec<u8> {
     buf
 }
 
-struct StartBlock<'a> {
-    block: &'a Block,
+struct StartBlock {
+    block_idx: usize,
     start_offset: [f32; 3],
 }
 
-fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock<'_>> {
+impl<'a> StartBlock {
+    fn get_block(&self, track_info: &'a TrackInfo) -> &'a Block {
+        let mut count = 0;
+        for part in &track_info.parts {
+            for block in &part.blocks {
+                if count == self.block_idx {
+                    return block;
+                }
+                count += 1;
+            }
+        }
+        panic!("Invalid start block index");
+    }
+}
+
+fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock> {
     let assets = assets();
     let mut best: Option<(u32, StartBlock)> = None;
+    let mut count = 0;
 
     for part in &track_info.parts {
         let part_data = assets
@@ -599,11 +633,12 @@ fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock<'_>> {
                 best = Some((
                     start_order,
                     StartBlock {
-                        block,
+                        block_idx: count,
                         start_offset,
                     },
                 ));
             }
+            count += 1;
         }
     }
 
@@ -611,8 +646,8 @@ fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock<'_>> {
         .ok_or_else(|| anyhow!("Track has no start position"))
 }
 
-fn calculate_start_transform(start: StartBlock<'_>, track_info: &TrackInfo) -> StartTransform {
-    let block = start.block;
+fn calculate_start_transform(start: StartBlock, track_info: &TrackInfo) -> StartTransform {
+    let block = start.get_block(track_info);
     let block_quat = face_rotation(block.dir, block.rotation);
     let y_flip = Quat::from_euler(EulerRot::XYZ, 0.0, PI, 0.0);
     let quaternion = block_quat * y_flip;
