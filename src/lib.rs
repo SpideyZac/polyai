@@ -280,6 +280,15 @@ pub mod simulation_worker {
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to update car state: {e}")))?;
             Ok(CarStatePy { car_state })
         }
+
+        fn raycast(
+            &mut self,
+            origin: [f32; 3],
+            direction: [f32; 3],
+            max_distance: f32,
+        ) -> Option<(u32, f32)> {
+            self.simulation.raycast(origin, direction, max_distance)
+        }
     }
 
     define_stub_info_gatherer!(stub_info);

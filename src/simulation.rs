@@ -1,8 +1,18 @@
-use std::f32::consts::{PI, SQRT_2};
+use std::{
+    collections::HashMap,
+    f32::consts::{PI, SQRT_2},
+};
 
 use anyhow::{Context, anyhow, bail};
 use bytemuck::cast_slice;
-use glam::{EulerRot, Quat, Vec2, Vec3};
+use parry3d::{
+    bounding_volume::Aabb,
+    glamx::{EulerRot, Quat},
+    math::{Pose, Vec2, Vec3},
+    partitioning::{Bvh, BvhBuildStrategy},
+    query::{Ray, RayCast},
+    shape::TriMesh,
+};
 use polytrack_codes::v6::{Block, Direction, TrackInfo, decode_track_code, decode_track_data};
 
 use crate::{
@@ -194,6 +204,110 @@ fn face_rotation(dir: Direction, rotation: u8) -> Quat {
     FACE_ROTATION_QUATS[dir as usize][rotation as usize]
 }
 
+struct MeshAsset {
+    mesh: TriMesh,
+}
+
+struct MeshInstance {
+    id: u32,
+    position: Vec3,
+    quaternion: Quat,
+}
+
+struct World {
+    assets: HashMap<u32, MeshAsset>,
+    mesh_instances: Vec<MeshInstance>,
+    bvh: Option<Bvh>,
+    aabbs: Vec<Aabb>,
+}
+
+impl World {
+    fn from_track_info(track_info: &TrackInfo, assets: &HashMap<u32, TriMesh>) -> Self {
+        let mut world = World {
+            assets: HashMap::new(),
+            mesh_instances: Vec::new(),
+            bvh: None,
+            aabbs: Vec::new(),
+        };
+
+        for (&id, mesh) in assets.iter() {
+            world.add_asset(id, mesh.clone());
+        }
+
+        for part in &track_info.parts {
+            for block in &part.blocks {
+                let position = Vec3::new(
+                    (block.x as i32 + track_info.min_x) as f32 * PART_SIZE,
+                    (block.y as i32 + track_info.min_y) as f32 * PART_SIZE,
+                    (block.z as i32 + track_info.min_z) as f32 * PART_SIZE,
+                );
+                let quaternion = face_rotation(block.dir, block.rotation);
+
+                if assets.contains_key(&(part.id as u32)) {
+                    world
+                        .add_instance(part.id as u32, position, quaternion)
+                        .unwrap();
+                }
+            }
+        }
+
+        world.build_bvh();
+        world
+    }
+
+    fn add_asset(&mut self, id: u32, mesh: TriMesh) {
+        self.assets.insert(id, MeshAsset { mesh });
+    }
+
+    fn add_instance(
+        &mut self,
+        asset_id: u32,
+        position: Vec3,
+        quaternion: Quat,
+    ) -> anyhow::Result<()> {
+        self.mesh_instances.push(MeshInstance {
+            id: asset_id,
+            position,
+            quaternion,
+        });
+
+        Ok(())
+    }
+
+    fn build_bvh(&mut self) {
+        self.aabbs.clear();
+
+        for inst in &self.mesh_instances {
+            let asset = &self.assets[&inst.id];
+
+            let local = asset.mesh.local_aabb();
+            let world = local.transform_by(&Pose::from_parts(inst.position, inst.quaternion));
+
+            self.aabbs.push(world);
+        }
+
+        self.bvh = Some(Bvh::from_leaves(BvhBuildStrategy::default(), &self.aabbs));
+    }
+
+    fn raycast(&self, origin: Vec3, dir: Vec3, max_toi: f32) -> Option<(u32, f32)> {
+        let bvh = self.bvh.as_ref()?;
+        let ray = Ray::new(origin, dir.normalize());
+
+        bvh.cast_ray(&ray, max_toi, |leaf_id, best| {
+            let inst = &self.mesh_instances[leaf_id as usize];
+            let asset = &self.assets[&inst.id];
+            let iso = Pose::from_parts(inst.position, inst.quaternion);
+            let local_ray = ray.inverse_transform_by(&iso);
+
+            asset.mesh.cast_local_ray(&local_ray, best, true)
+        })
+        .map(|(leaf_id, toi)| {
+            let inst = &self.mesh_instances[leaf_id as usize];
+            (inst.id, toi)
+        })
+    }
+}
+
 struct TableRng {
     index: usize,
 }
@@ -355,13 +469,13 @@ pub struct SimulationWorker {
     exports: Exports,
     cars: Vec<Car>,
     car_state_buffer_ptr: i32,
-    pub track_info: TrackInfo,
     start: StartTransform,
     mountain_ptr: i32,
     track_ptr: i32,
     part_count: i32,
     mountain_vertices_len: i32,
     mountain_offset: Vec3,
+    world: World,
 }
 
 impl SimulationWorker {
@@ -387,18 +501,35 @@ impl SimulationWorker {
         let mountain_vertices_len = mountain.vertices.len() as i32;
         let mountain_offset = mountain.offset;
 
+        let assets = assets();
+        let mut assets_map = HashMap::new();
+        for part in assets.track_parts.iter() {
+            let mesh = TriMesh::new(
+                part.vertices
+                    .chunks(3)
+                    .map(|v| Vec3::from_slice(v))
+                    .collect(),
+                (0..part.vertices.len() / 3)
+                    .map(|i| [i as u32 * 3, i as u32 * 3 + 1, i as u32 * 3 + 2])
+                    .collect(),
+            )
+            .expect("Failed to create mesh");
+            assets_map.insert(part.id as u32, mesh);
+        }
+        let world = World::from_track_info(&track_info, &assets_map);
+
         Self {
             physics,
             exports,
             cars: vec![],
             car_state_buffer_ptr,
-            track_info,
             start,
             mountain_ptr,
             track_ptr,
             part_count,
             mountain_vertices_len,
             mountain_offset,
+            world,
         }
     }
 
@@ -539,6 +670,19 @@ impl SimulationWorker {
 
         let car_state_buffer = self.physics.wasm_slice(self.car_state_buffer_ptr, 227)?;
         CarState::deserialize(car_state_buffer[4..].try_into()?)
+    }
+
+    pub fn raycast(
+        &self,
+        origin: [f32; 3],
+        dir: [f32; 3],
+        max_distance: f32,
+    ) -> Option<(u32, f32)> {
+        self.world.raycast(
+            Vec3::from_array(origin),
+            Vec3::from_array(dir),
+            max_distance,
+        )
     }
 }
 
