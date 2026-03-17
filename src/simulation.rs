@@ -585,30 +585,14 @@ fn pack_track_data(track_info: &TrackInfo) -> Vec<u8> {
     buf
 }
 
-struct StartBlock {
-    block_idx: usize,
+struct StartBlock<'a> {
+    block: &'a Block,
     start_offset: [f32; 3],
 }
 
-impl<'a> StartBlock {
-    fn get_block(&self, track_info: &'a TrackInfo) -> &'a Block {
-        let mut count = 0;
-        for part in &track_info.parts {
-            for block in &part.blocks {
-                if count == self.block_idx {
-                    return block;
-                }
-                count += 1;
-            }
-        }
-        panic!("Invalid start block index");
-    }
-}
-
-fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock> {
+fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock<'_>> {
     let assets = assets();
     let mut best: Option<(u32, StartBlock)> = None;
-    let mut count = 0;
 
     for part in &track_info.parts {
         let part_data = assets
@@ -633,12 +617,11 @@ fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock> {
                 best = Some((
                     start_order,
                     StartBlock {
-                        block_idx: count,
+                        block,
                         start_offset,
                     },
                 ));
             }
-            count += 1;
         }
     }
 
@@ -647,7 +630,7 @@ fn find_start_block(track_info: &TrackInfo) -> anyhow::Result<StartBlock> {
 }
 
 fn calculate_start_transform(start: StartBlock, track_info: &TrackInfo) -> StartTransform {
-    let block = start.get_block(track_info);
+    let block = start.block;
     let block_quat = face_rotation(block.dir, block.rotation);
     let y_flip = Quat::from_euler(EulerRot::XYZ, 0.0, PI, 0.0);
     let quaternion = block_quat * y_flip;
