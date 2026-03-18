@@ -1,11 +1,7 @@
-"""
-Simple HTTP + WebSocket server for serving a site and sending frame data.
-"""
+"""HTTP + WebSocket server for replay viewing."""
 
 import asyncio
-import threading
 import http.server
-import webbrowser
 import json
 from typing import Set
 
@@ -17,33 +13,36 @@ WS_PORT: int = 8765
 DIRECTORY: str = "replay_viewer"
 
 clients: Set[ServerConnection] = set()
-loop: asyncio.AbstractEventLoop | None = None
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
-    """Fast static file handler."""
+    """Serve static files without logging."""
 
     protocol_version = "HTTP/1.1"
 
     def __init__(self, *args, **kwargs):
+        """Initialize handler with fixed directory."""
         super().__init__(*args, directory=DIRECTORY, **kwargs)
 
-    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
+    # pylint: disable=redefined-builtin
+    def log_message(self, format, *args):
+        """Suppress request logs."""
         return
 
     def address_string(self) -> str:
+        """Return client IP."""
         return self.client_address[0]
 
 
 def start_http_server() -> None:
-    """Start the HTTP server."""
+    """Run the HTTP server."""
     with http.server.ThreadingHTTPServer(("", HTTP_PORT), Handler) as httpd:
         print(f"HTTP server running at http://localhost:{HTTP_PORT}")
         httpd.serve_forever()
 
 
 async def ws_handler(websocket: ServerConnection) -> None:
-    """Handle a WebSocket connection."""
+    """Handle a WebSocket client."""
     clients.add(websocket)
     print("Client connected")
 
@@ -56,14 +55,14 @@ async def ws_handler(websocket: ServerConnection) -> None:
 
 
 async def start_ws_server() -> None:
-    """Start the WebSocket server."""
+    """Run the WebSocket server forever."""
     async with websockets.serve(ws_handler, "localhost", WS_PORT):
         print(f"WebSocket server running at ws://localhost:{WS_PORT}")
         await asyncio.Future()
 
 
 async def send_data(export_string: str, recording_string: str, frames: int) -> None:
-    """Send data to all connected clients."""
+    """Send replay data to all clients."""
     if not clients:
         return
 
@@ -79,35 +78,3 @@ async def send_data(export_string: str, recording_string: str, frames: int) -> N
         *(client.send(msg) for client in clients),
         return_exceptions=True,
     )
-
-
-def send(export_string: str, recording_string: str, frames: int) -> None:
-    """Thread-safe send."""
-    if loop is None:
-        return
-
-    asyncio.run_coroutine_threadsafe(
-        send_data(export_string, recording_string, frames),
-        loop,
-    )
-
-
-def start() -> None:
-    """Start servers and open the browser."""
-
-    http_thread = threading.Thread(
-        target=start_http_server,
-        daemon=True,
-    )
-    http_thread.start()
-
-    def run_loop():
-        global loop  # pylint: disable=global-statement
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(start_ws_server())
-
-    ws_thread = threading.Thread(target=run_loop, daemon=True)
-    ws_thread.start()
-
-    webbrowser.open(f"http://localhost:{HTTP_PORT}")

@@ -1,6 +1,8 @@
 mod data_reader;
 mod physics_worker;
 mod simulation;
+#[cfg(test)]
+mod world_explorer;
 
 use std::sync::OnceLock;
 

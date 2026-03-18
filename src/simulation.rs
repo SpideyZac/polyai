@@ -204,21 +204,21 @@ fn face_rotation(dir: Direction, rotation: u8) -> Quat {
     FACE_ROTATION_QUATS[dir as usize][rotation as usize]
 }
 
-struct MeshAsset {
-    mesh: TriMesh,
+pub struct MeshAsset {
+    pub mesh: TriMesh,
 }
 
-struct MeshInstance {
-    id: u32,
-    position: Vec3,
-    quaternion: Quat,
+pub struct MeshInstance {
+    pub id: u32,
+    pub position: Vec3,
+    pub quaternion: Quat,
 }
 
-struct World {
-    assets: HashMap<u32, MeshAsset>,
-    mesh_instances: Vec<MeshInstance>,
-    bvh: Option<Bvh>,
-    aabbs: Vec<Aabb>,
+pub struct World {
+    pub assets: HashMap<u32, MeshAsset>,
+    pub mesh_instances: Vec<MeshInstance>,
+    pub bvh: Option<Bvh>,
+    pub aabbs: Vec<Aabb>,
 }
 
 impl World {
@@ -289,7 +289,7 @@ impl World {
         self.bvh = Some(Bvh::from_leaves(BvhBuildStrategy::default(), &self.aabbs));
     }
 
-    fn raycast(&self, origin: Vec3, dir: Vec3, max_toi: f32) -> Option<(u32, f32)> {
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_toi: f32) -> Option<(u32, f32)> {
         let bvh = self.bvh.as_ref()?;
         let ray = Ray::new(origin, dir.normalize());
 
@@ -504,17 +504,14 @@ impl SimulationWorker {
         let assets = assets();
         let mut assets_map = HashMap::new();
         for part in assets.track_parts.iter() {
-            let mesh = TriMesh::new(
-                part.vertices
-                    .chunks(3)
-                    .map(|v| Vec3::from_slice(v))
-                    .collect(),
-                (0..part.vertices.len() / 3)
-                    .map(|i| [i as u32 * 3, i as u32 * 3 + 1, i as u32 * 3 + 2])
-                    .collect(),
-            )
-            .expect("Failed to create mesh");
-            assets_map.insert(part.id as u32, mesh);
+            let vertices: Vec<Vec3> = part.vertices.chunks(3).map(Vec3::from_slice).collect();
+
+            let indices: Vec<[u32; 3]> = (0..vertices.len() / 3)
+                .map(|i| [i as u32 * 3, i as u32 * 3 + 1, i as u32 * 3 + 2])
+                .collect();
+
+            let mesh = TriMesh::new(vertices, indices).expect("Failed to create mesh");
+            assets_map.insert(part.id, mesh);
         }
         let world = World::from_track_info(&track_info, &assets_map);
 
@@ -980,5 +977,44 @@ impl<'a> Reader<'a> {
             self.read_f32_le()?,
             self.read_f32_le()?,
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world_explorer;
+
+    #[test]
+    fn explore_world() {
+        let track_info = decode_track("PolyTrack24pdrVdskciFE8XCb3wRMNeeewNMvHNe2G3XftlmdkmRaPuRSkZdjoSysIWv4pl4S1STwDRzKiHJBJ44eVK0lkDs4GjdNUOdkl0FmEorcHZ02TdYD1uJUV6qgwRXKwjucnL0y81hxFFHx9yNOANRKFKNfS627RCOiwqLSqIoFlBca72GYWC0GAph3jAGQtbwLcAkYThEeuF9olyBEAFh0XtTDTYWzuHpCktWNeOnLnZuqGFmva4dRuBGoHED6dZNjEIIRZnQi3pt03tqWqgE5dojDp2nTLy0KJWBW7PRI69Ol7TOmESCvFQeAOFbrxfGDd3AbV9Au1jAqVdYY3W7YRJGbqEAj05u8aNQRzmVnPkJj1iljU51pCgrLeqSY2pUtaXYcKJNeIKQYs9T2LfGeQrsUYVLT25i1IU2N3Bl8l1leqWa9Ahmk9D3UmwcQNnSBlynlISO23aJaNFjeS5gW8IMsZRsfpcE4qbRabrXIDJBNlQy7t1BCfEjwGyXJt5vZKi4LMYIM4xTlsZZHXuz8k9QEeJs9gJpIv9MVynPlZt002SGkTjkEk3U8NkhGeJuPFiv0jNS91k0LET77Mr8ImufhDgY6cfjVPkwhV7MSaMR7Z1IQcesNq4wmIYcObELODkoehQuEC9mcr6ovy3p6aXdqvDXi2dtnRcbPAfYsve3RkAYafM3mK1vkMh37PuK1XIBQezZPwtmoeUfkigd4vXUuVvhifBxn4el3ZxffRWOLmHX06B9wQBrhr8Mr3xadI2F1aPEDngAqfOgzbbHRTneH6mRhxgIldZEyi8Wc5jd2gygS0y0desgpuAyAeNMmDcLcLie5B2lzyQ1zIHQQzWF1vJjmtnfbC6UIXy6yI5zGyGyPxa9gw8E3BU0sVT9VCSCdJXhtVQcW0SRbtBeI8nKHHXfKgve2NTrheuJ4wTUmGci0Na49RGxeHZE3fMjY6k9EjbtFPLjZdKvZm6BhORyuwuWOEM1EQqSISU7ext7lwBY4JdtTVjUhtxALC37eRG3HgcqviUavOESJ2eV2ZvkpRw8y6wejYq0wHN1xCErYWzOucVFPqVFYj4ATHrW5aZPzdm7sSMHv8WyeEVdJ8fN1lsmEm19fWvLhLf9lpyecfsJBbIsISLTt5HEQYfe9keEbFMVCy1L7lLywRopov0q76br3oM0WaQqp2Yf380jZHzEeGnkMqBqBivxoHWXHSSm38jeRzvt53NWecbE51qtjqeC6m0bvmRjnO8rHDfzXtNmd38iRhPGSn5Ib19VPzBeF5SFqB5gb6T2v0KsxReMyCc7YWaDQgWfzZd1kuuE7OWSkjYGPp4bfJZnu9KpkteZjpuqweFhY2FBqHxSyYxe7ZEYAepeBIIkMetGNhgeOxaNLjve8nNlcfGHD7FsGXhIkGHBJ0HvfAUfojDoO4Hne5oQn51oeLkEz2Efdke7OyE3SoCbk50cfrzvYsY8mMmcmsVeScqj2rOfS9epl5fpQFGqjhGHVXY83C4WEB6WTHjwueP3tYLCGCZiHyc0WeEcupH1Cps0mmikCQnnfvfKG12peXnT1XNIfZEoaEy9aAeQ6ciSb4Gm0pSyR1UFqclSEBfKq5MeIySoPFFiLRcK8mztlSDeujKhYkksZ28j57oG8nmFx2siyrewpyIEvczxnW2Unyqnlt7VqvNY4zoVCfKtrrBCb7w8zjheyXMAeqo6HTRwTOhjSBSoyaf9fQCgsPOdIuMfPgaGstZ")
+            .expect("Failed to decode track");
+
+        let asset_data = assets();
+        let mut assets_map = std::collections::HashMap::new();
+        for part in asset_data.track_parts.iter() {
+            let vertices: Vec<Vec3> = part.vertices.chunks(3).map(Vec3::from_slice).collect();
+            let indices: Vec<[u32; 3]> = (0..vertices.len() / 3)
+                .map(|i| [i as u32 * 3, i as u32 * 3 + 1, i as u32 * 3 + 2])
+                .collect();
+            let mesh = TriMesh::new(vertices, indices).expect("Failed to create mesh");
+            assets_map.insert(part.id, mesh);
+        }
+
+        let world = World::from_track_info(&track_info, &assets_map);
+        let start = find_start_block(&track_info).expect("No start block");
+        let start_tf = calculate_start_transform(start, &track_info);
+
+        world_explorer::run_explorer(
+            &world,
+            world_explorer::ExplorerConfig {
+                start_pos: [
+                    start_tf.position.x,
+                    start_tf.position.y + 10.0,
+                    start_tf.position.z,
+                ],
+                ..Default::default()
+            },
+        );
     }
 }
