@@ -1,34 +1,104 @@
+"""
+A gRPC proxy for Ray's GCS server that blocks job, task, and driver worker creation.
+Prevents RCE from malicious workers.
+"""
+
 import asyncio
-import grpc
-import grpc.aio
 import argparse
 import logging
 import inspect
+import grpc
+import grpc.aio
+from google.protobuf.json_format import MessageToDict
 from ray.core.generated import gcs_service_pb2_grpc
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gcs-proxy")
 
 
-def build_passthrough_servicer(servicer_class, stub):
+def to_dict(request):
+    """Convert a protobuf message to a dictionary, preserving field names."""
+    try:
+        return MessageToDict(request, preserving_proto_field_name=True)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+
+
+def is_driver_worker(req):
     """
-    Build a generic passthrough servicer for all services except JobInfoGcsService.
-    Logs RPC method names.
+    Check if the worker being added is a driver worker.
+    This is based on the "worker_type" field in the request,
+    which should be "DRIVER" for driver workers.
+    """
+    try:
+        wt = req.get("worker_data", {}).get("worker_type")
+        return wt == "DRIVER"
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def should_block(servicer, method, req):
+    """
+    Determine if a request should be blocked based on the servicer, method, and request content.
+    """
+    if servicer == "TaskInfoGcsServiceServicer" and method == "AddTaskEventData":
+        return True
+
+    if servicer == "JobInfoGcsServiceServicer" and method == "AddJob":
+        return True
+
+    if servicer == "WorkerInfoGcsServiceServicer" and method == "AddWorkerInfo":
+        return is_driver_worker(req)
+
+    if servicer == "JobInfoGcsServiceServicer" and method == "GetNextJobID":
+        return True
+
+    if servicer == "InternalKVGcsServiceServicer" and method == "InternalKVPut":
+        namespace = req.get("namespace", "")
+        if namespace == "ZnVu":
+            return True
+
+    return False
+
+
+def build_servicer(servicer_class, stub):
+    """
+    Build a proxy servicer that intercepts calls to the specified methods
+    and applies blocking logic.
     """
     stub_methods = {
-        name for name in dir(stub)
+        name
+        for name in dir(stub)
         if not name.startswith("_") and callable(getattr(stub, name))
     }
     servicer_methods = {
-        name for name, _ in inspect.getmembers(servicer_class, predicate=inspect.isfunction)
+        name
+        for name, _ in inspect.getmembers(servicer_class, predicate=inspect.isfunction)
         if not name.startswith("_")
     }
 
     def make_handler(stub_method, method_name):
-        async def handler(self, request, context):
-            log.info(f"RPC called: {servicer_class.__name__}/{method_name}")
-            md = list(context.invocation_metadata())
+        async def handler(_self, request, context: grpc.aio.ServicerContext):
+            req_dict = to_dict(request)
+
+            if should_block(servicer_class.__name__, method_name, req_dict):
+                log.warning("[BLOCKED] %s/%s", servicer_class.__name__, method_name)
+                log.warning("Called from IP: %s", context.peer())
+
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details("Blocked by GCS proxy policy")
+                await context.abort(
+                    grpc.StatusCode.PERMISSION_DENIED, "Blocked by GCS proxy policy"
+                )
+                return
+
+            invocation_metadata = context.invocation_metadata()
+            if invocation_metadata is not None:
+                md = list(invocation_metadata)
+            else:
+                md = []
             return await stub_method(request, metadata=md)
+
         return handler
 
     attrs = {}
@@ -36,79 +106,45 @@ def build_passthrough_servicer(servicer_class, stub):
         stub_method = getattr(stub, method)
         attrs[method] = make_handler(stub_method, method)
 
-    return type(f"{servicer_class.__name__}Passthrough", (servicer_class,), attrs)()
-
-
-def build_jobinfo_servicer(stub):
-    """
-    Build a JobInfoGcsServiceServicer that blocks GetNextJobID
-    and forwards all other RPCs, logging their names.
-    """
-    servicer_cls = gcs_service_pb2_grpc.JobInfoGcsServiceServicer
-    attrs = {}
-
-    # Intercept GetNextJobID
-    async def GetNextJobID(self, request, context):
-        log.info("RPC called: JobInfoGcsService/GetNextJobID (blocked)")
-        context.set_code(grpc.StatusCode.PERMISSION_DENIED)
-    attrs["GetNextJobID"] = GetNextJobID
-
-    # Passthrough all other methods
-    for method_name in dir(servicer_cls):
-        if method_name.startswith("_") or method_name == "GetNextJobID":
-            continue
-        base_method = getattr(servicer_cls, method_name, None)
-        if not callable(base_method):
-            continue
-
-        def make_passthrough(_stub_method_name):
-            async def passthrough(self, request, context):
-                log.info(f"RPC called: JobInfoGcsService/{_stub_method_name}")
-                stub_method = getattr(stub, _stub_method_name)
-                md = list(context.invocation_metadata())
-                return await stub_method(request, metadata=md)
-            return passthrough
-
-        attrs[method_name] = make_passthrough(method_name)
-
-    return type("JobInfoServicerProxy", (servicer_cls,), attrs)()
+    return type(f"{servicer_class.__name__}Proxy", (servicer_class,), attrs)()
 
 
 def discover_services(module):
     """
-    Discover all servicers in the gcs_service_pb2_grpc module.
-    Returns list of (servicer_class, add_fn, stub_class)
+    Discover gRPC services in the specified module by looking for classes
+    that end with "Servicer" and their corresponding add_*_to_server functions and Stub classes.
     """
     services = []
     for name, servicer_class in inspect.getmembers(module, inspect.isclass):
         if not name.endswith("Servicer"):
             continue
-        base_name = name[: -len("Servicer")]
+        base = name[: -len("Servicer")]
         add_fn = getattr(module, f"add_{name}_to_server", None)
-        stub_class = getattr(module, f"{base_name}Stub", None)
-        if add_fn and stub_class:
-            services.append((servicer_class, add_fn, stub_class))
+        stub = getattr(module, f"{base}Stub", None)
+        if add_fn and stub:
+            services.append((servicer_class, add_fn, stub))
     return services
 
 
-async def serve(listen_port: int, upstream_addr: str):
-    upstream_channel = grpc.aio.insecure_channel(upstream_addr)
+async def serve(listen_port: int, upstream: str):
+    """
+    Start the gRPC proxy server that listens on the specified port
+    and forwards requests to the upstream GCS server, applying blocking logic as needed.
+    """
+    channel = grpc.aio.insecure_channel(upstream)
     server = grpc.aio.server()
 
     for servicer_class, add_fn, stub_class in discover_services(gcs_service_pb2_grpc):
-        stub = stub_class(upstream_channel)
-        if servicer_class is gcs_service_pb2_grpc.JobInfoGcsServiceServicer:
-            job_servicer = build_jobinfo_servicer(stub)
-            add_fn(job_servicer, server)
-            log.info("Registered JobInfoServicer with GetNextJobID interception and passthrough")
-        else:
-            passthrough = build_passthrough_servicer(servicer_class, stub)
-            add_fn(passthrough, server)
-            log.info(f"Registered passthrough servicer for {servicer_class.__name__}")
+        stub = stub_class(channel)
+        proxy = build_servicer(servicer_class, stub)
+        add_fn(proxy, server)
+        log.info("Registered %s", servicer_class.__name__)
 
-    listen_addr = f"[::]:{listen_port}"
-    server.add_insecure_port(listen_addr)
-    log.info(f"Proxy listening on {listen_addr}, upstream GCS at {upstream_addr}")
+    addr = f"[::]:{listen_port}"
+    server.add_insecure_port(addr)
+
+    log.info("Listening on %s, upstream %s", addr, upstream)
+
     await server.start()
     await server.wait_for_termination()
 
