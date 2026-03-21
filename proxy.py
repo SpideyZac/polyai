@@ -3,6 +3,8 @@ A gRPC proxy for Ray's GCS server that blocks job, task, and driver worker creat
 Prevents RCE from malicious workers.
 """
 
+from typing import Any, Callable
+
 import asyncio
 import argparse
 import logging
@@ -17,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gcs-proxy")
 
 
-def to_dict(request: Message) -> dict:
+def to_dict(request: Message) -> dict[str, Any]:
     """Convert a protobuf message to a dictionary, preserving field names."""
     try:
         return MessageToDict(request, preserving_proto_field_name=True)
@@ -25,7 +27,7 @@ def to_dict(request: Message) -> dict:
         return {}
 
 
-def is_driver_worker(req: dict):
+def is_driver_worker(req: dict[str, Any]) -> bool:
     """
     Check if the worker being added is a driver worker.
     This is based on the "worker_type" field in the request,
@@ -38,7 +40,7 @@ def is_driver_worker(req: dict):
         return False
 
 
-def should_block(servicer: str, method: str, req: dict) -> bool:
+def should_block(servicer: str, method: str, req: dict[str, Any]) -> bool:
     """
     Determine if a request should be blocked based on the servicer, method, and request content.
     """
@@ -56,7 +58,9 @@ def should_block(servicer: str, method: str, req: dict) -> bool:
 
     if servicer == "InternalKVGcsServiceServicer" and method == "InternalKVPut":
         namespace = req.get("namespace", "")
-        if namespace == "ZnVu":
+        if (
+            namespace == "ZnVu"
+        ):  # "ZnVu" is "fun" in base64, which is used for RCE in Ray.
             return True
 
     return False
@@ -78,7 +82,9 @@ def build_servicer(servicer_class: type, stub: grpc.aio.Channel) -> object:
         if not name.startswith("_")
     }
 
-    def make_handler(stub_method, method_name):
+    def make_handler(
+        stub_method: Callable, method_name: str
+    ) -> Callable[[object, Message, grpc.aio.ServicerContext], Any]:
         async def handler(_self, request, context: grpc.aio.ServicerContext):
             req_dict = to_dict(request)
 
@@ -110,7 +116,7 @@ def build_servicer(servicer_class: type, stub: grpc.aio.Channel) -> object:
     return type(f"{servicer_class.__name__}Proxy", (servicer_class,), attrs)()
 
 
-def discover_services(module: object) -> list:
+def discover_services(module: object) -> list[tuple[type, Callable, type]]:
     """
     Discover gRPC services in the specified module by looking for classes
     that end with "Servicer" and their corresponding add_*_to_server functions and Stub classes.
