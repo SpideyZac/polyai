@@ -10,13 +10,14 @@ import inspect
 import grpc
 import grpc.aio
 from google.protobuf.json_format import MessageToDict
+from google.protobuf.message import Message
 from ray.core.generated import gcs_service_pb2_grpc
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gcs-proxy")
 
 
-def to_dict(request):
+def to_dict(request: Message) -> dict:
     """Convert a protobuf message to a dictionary, preserving field names."""
     try:
         return MessageToDict(request, preserving_proto_field_name=True)
@@ -24,7 +25,7 @@ def to_dict(request):
         return {}
 
 
-def is_driver_worker(req):
+def is_driver_worker(req: dict):
     """
     Check if the worker being added is a driver worker.
     This is based on the "worker_type" field in the request,
@@ -37,7 +38,7 @@ def is_driver_worker(req):
         return False
 
 
-def should_block(servicer, method, req):
+def should_block(servicer: str, method: str, req: dict) -> bool:
     """
     Determine if a request should be blocked based on the servicer, method, and request content.
     """
@@ -61,7 +62,7 @@ def should_block(servicer, method, req):
     return False
 
 
-def build_servicer(servicer_class, stub):
+def build_servicer(servicer_class: type, stub: grpc.aio.Channel) -> object:
     """
     Build a proxy servicer that intercepts calls to the specified methods
     and applies blocking logic.
@@ -109,7 +110,7 @@ def build_servicer(servicer_class, stub):
     return type(f"{servicer_class.__name__}Proxy", (servicer_class,), attrs)()
 
 
-def discover_services(module):
+def discover_services(module: object) -> list:
     """
     Discover gRPC services in the specified module by looking for classes
     that end with "Servicer" and their corresponding add_*_to_server functions and Stub classes.
@@ -126,7 +127,7 @@ def discover_services(module):
     return services
 
 
-async def serve(listen_port: int, upstream: str):
+async def serve(listen_port: int, upstream: str) -> None:
     """
     Start the gRPC proxy server that listens on the specified port
     and forwards requests to the upstream GCS server, applying blocking logic as needed.
