@@ -171,9 +171,12 @@ class PolyTrackEnv(gym.Env):
         origin = (pos_x, pos_y, pos_z)
 
         world_dirs = self._ALL_DIRS @ rot_matrix.T
-        distances = PolyTrackEnv._sim_worker.raycast_batch(
-            origin, world_dirs, RAYCAST_MAX_DISTANCE
-        )
+        distances = [
+            r[1]
+            for r in PolyTrackEnv._sim_worker.raycast_batch(
+                origin, world_dirs, RAYCAST_MAX_DISTANCE
+            )
+        ]
 
         obs[54 : 54 + NUM_RAYCASTS_FRONT + NUM_RAYCASTS_BACK] = distances
 
