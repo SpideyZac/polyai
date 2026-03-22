@@ -20,11 +20,13 @@ fn engine() -> &'static Engine {
 
 #[pymodule]
 pub mod simulation_worker {
+    use numpy::PyReadonlyArray2;
     use pyo3::{PyResult, exceptions::PyRuntimeError, pyclass, pymethods};
     use pyo3_stub_gen::{
         define_stub_info_gatherer,
         derive::{gen_stub_pyclass, gen_stub_pymethods},
     };
+    use rayon::iter::{ParallelBridge, ParallelIterator};
 
     use crate::{
         MODULE, engine,
@@ -183,7 +185,7 @@ pub mod simulation_worker {
             self.car_state.wheel_skid_info
         }
 
-        fn get_sterring(&self) -> f32 {
+        fn get_steering(&self) -> f32 {
             self.car_state.steering
         }
 
@@ -199,6 +201,14 @@ pub mod simulation_worker {
                 left: self.car_state.controls.left,
                 reset: self.car_state.controls.reset,
             }
+        }
+
+        fn get_is_finishline_cp(&self) -> bool {
+            self.car_state.is_finishline_cp
+        }
+
+        fn get_next_checkpoint_position(&self) -> [f32; 3] {
+            self.car_state.next_checkpoint_position
         }
     }
 
@@ -283,13 +293,20 @@ pub mod simulation_worker {
             Ok(CarStatePy { car_state })
         }
 
-        fn raycast(
+        fn raycast_batch(
             &mut self,
             origin: [f32; 3],
-            direction: [f32; 3],
+            directions: PyReadonlyArray2<f32>,
             max_distance: f32,
-        ) -> Option<(u32, f32)> {
-            self.simulation.raycast(origin, direction, max_distance)
+        ) -> Vec<(u32, f32)> {
+            let dirs = directions.as_array();
+            dirs.outer_iter()
+                .par_bridge()
+                .map(|row| {
+                    let dir = [row[0], row[1], row[2]];
+                    self.simulation.raycast(origin, dir, max_distance)
+                })
+                .collect()
         }
     }
 

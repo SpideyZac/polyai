@@ -27,6 +27,7 @@ const MOUNTAIN_RING_SEGMENTS: usize = 8;
 const MOUNTAIN_MIN_RADIUS: f32 = 200.0;
 const MOUNTAIN_RADIUS_BASE: f32 = 160.0;
 const MOUNTAIN_MAX_RADIUS: f32 = 4500.0;
+const FINISH_LINE_IDS: [u8; 4] = [74, 6, 78, 76];
 
 #[allow(clippy::excessive_precision, clippy::approx_constant)]
 const FACE_ROTATION_QUATS: [[Quat; 4]; 6] = [
@@ -289,8 +290,8 @@ impl World {
         self.bvh = Some(Bvh::from_leaves(BvhBuildStrategy::default(), &self.aabbs));
     }
 
-    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_toi: f32) -> Option<(u32, f32)> {
-        let bvh = self.bvh.as_ref()?;
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_toi: f32) -> (u32, f32) {
+        let bvh = self.bvh.as_ref().expect("BVH not built");
         let ray = Ray::new(origin, dir.normalize());
 
         bvh.cast_ray(&ray, max_toi, |leaf_id, best| {
@@ -305,6 +306,7 @@ impl World {
             let inst = &self.mesh_instances[leaf_id as usize];
             (inst.id, toi)
         })
+        .expect("Raycast failed")
     }
 }
 
@@ -469,6 +471,8 @@ pub struct SimulationWorker {
     exports: Exports,
     cars: Vec<Car>,
     car_state_buffer_ptr: i32,
+    track_info: TrackInfo,
+    max_checkpoint: u16,
     start: StartTransform,
     mountain_ptr: i32,
     track_ptr: i32,
@@ -486,6 +490,15 @@ impl SimulationWorker {
             .expect("Failed to allocate car state buffer");
 
         let track_info = decode_track(export_string).expect("Failed to decode track");
+
+        let max_checkpoint = track_info
+            .parts
+            .iter()
+            .flat_map(|part| part.blocks.iter())
+            .map(|block| block.cp_order.unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+
         let start_block = find_start_block(&track_info).expect("Failed to find start block");
         let start = calculate_start_transform(start_block, &track_info);
         let mountain = build_mountain_mesh(&track_info);
@@ -520,6 +533,8 @@ impl SimulationWorker {
             exports,
             cars: vec![],
             car_state_buffer_ptr,
+            track_info,
+            max_checkpoint,
             start,
             mountain_ptr,
             track_ptr,
@@ -666,15 +681,15 @@ impl SimulationWorker {
         )?;
 
         let car_state_buffer = self.physics.wasm_slice(self.car_state_buffer_ptr, 227)?;
-        CarState::deserialize(car_state_buffer[4..].try_into()?)
+        CarState::deserialize(
+            car_state_buffer[4..].try_into()?,
+            self.max_checkpoint,
+            &self.track_info,
+        )
+        .context("Failed to deserialize car state")
     }
 
-    pub fn raycast(
-        &self,
-        origin: [f32; 3],
-        dir: [f32; 3],
-        max_distance: f32,
-    ) -> Option<(u32, f32)> {
+    pub fn raycast(&self, origin: [f32; 3], dir: [f32; 3], max_distance: f32) -> (u32, f32) {
         self.world.raycast(
             Vec3::from_array(origin),
             Vec3::from_array(dir),
@@ -813,10 +828,17 @@ pub struct CarState {
     pub steering: f32,
     pub brake_light_enabled: bool,
     pub controls: PlayerController,
+
+    pub is_finishline_cp: bool,
+    pub next_checkpoint_position: [f32; 3],
 }
 
 impl CarState {
-    pub fn deserialize(buf: &[u8]) -> anyhow::Result<Self> {
+    pub fn deserialize(
+        buf: &[u8],
+        max_checkpoint: u16,
+        track_info: &TrackInfo,
+    ) -> anyhow::Result<Self> {
         let mut r = Reader::new(buf);
 
         let frames = r.read_u24_le().context("frames")?;
@@ -889,6 +911,47 @@ impl CarState {
         };
         let brake_light_enabled = control_byte & 32 != 0;
 
+        let is_finishline_cp = next_checkpoint_index == max_checkpoint + 1;
+        let next_cp = if is_finishline_cp {
+            let finish_parts = track_info
+                .parts
+                .iter()
+                .filter(|part| FINISH_LINE_IDS.contains(&part.id))
+                .collect::<Vec<_>>();
+
+            finish_parts
+                .iter()
+                .flat_map(|part| part.blocks.iter())
+                .map(|block| {
+                    let block_pos = Vec3::new(
+                        (block.x as i32 + track_info.min_x) as f32 * PART_SIZE,
+                        (block.y as i32 + track_info.min_y) as f32 * PART_SIZE,
+                        (block.z as i32 + track_info.min_z) as f32 * PART_SIZE,
+                    );
+                    let dist = Vec3::from_array(position).distance(block_pos);
+                    (dist, block_pos)
+                })
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+                .expect("No finish line blocks found")
+                .1
+                .to_array()
+        } else {
+            track_info
+                .parts
+                .iter()
+                .flat_map(|part| part.blocks.iter())
+                .filter(|block| block.cp_order == Some(next_checkpoint_index))
+                .map(|block| {
+                    [
+                        (block.x as i32 + track_info.min_x) as f32 * PART_SIZE,
+                        (block.y as i32 + track_info.min_y) as f32 * PART_SIZE,
+                        (block.z as i32 + track_info.min_z) as f32 * PART_SIZE,
+                    ]
+                })
+                .next()
+                .expect("Next checkpoint block not found")
+        };
+
         Ok(Self {
             frames,
             speed_kmh,
@@ -907,6 +970,8 @@ impl CarState {
             steering,
             brake_light_enabled,
             controls,
+            is_finishline_cp,
+            next_checkpoint_position: next_cp,
         })
     }
 }

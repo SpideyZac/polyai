@@ -1,3 +1,10 @@
+[build-system]
+requires = ["maturin>=1.12.6,<2.0"]
+build-backend = "maturin"
+
+[tool.uv]
+cache-keys = [{file = "rust/Cargo.toml"}, {file = "**/*.rs"}]
+
 [project]
 name = "polyai"
 version = "0.1.0"
@@ -14,5 +21,5 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "maturin>=1.12.6",
+    "scipy-stubs>=1.17.1.2",
 ]
