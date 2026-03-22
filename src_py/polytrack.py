@@ -1,8 +1,9 @@
+"""A Gymnasium environment for PolyTrack."""
+
 # pylint: disable=no-name-in-module
 
 import functools
 from typing import Any
-from multiprocessing import Process, Queue
 
 import numpy as np
 import gymnasium as gym
@@ -10,7 +11,7 @@ from gymnasium import spaces
 from simulation_worker import SimulationWorkerPy, PlayerControllerPy, CarStatePy
 from ray.rllib.utils.typing import EnvConfigDict
 
-from src_py.viewer_process import run_viewer
+from src_py.reward import RewardSystem
 
 # pylint: disable=pointless-string-statement
 """
@@ -35,32 +36,34 @@ NUM_INPUTS = 1 + 1 + 3 + 4 + (4 * 6) + 4 + 4 + 4 + 4 + 1 + 4 + 50 + 15 + 3
 NUM_RAYCASTS_FRONT = 50
 NUM_RAYCASTS_BACK = 15
 RAYCAST_MAX_DISTANCE = 10.0
+MAX_FRAMES = 1000
+
+DEFAULT_REWARD_SYSTEM = RewardSystem()
 
 
 class PolyTrackEnv(gym.Env):
+    """Gymnasium environment wrapping the PolyTrack simulation."""
+
     _ALL_DIRS = None
     _sim_worker: SimulationWorkerPy
-    _queue: Queue
-    _viewer_process: Process
     _last_car_id: int = 0
 
     def __init__(self, config: EnvConfigDict | None = None):
+        """Initialise the environment, simulation worker, and viewer process."""
         assert config is not None, "Config cannot be None."
         export_string = config.get("export_string", "")
         assert (
             export_string or PolyTrackEnv._sim_worker is not None
         ), "Export string cannot be empty."
-        render_mode = config.get("render_mode", "none")
 
-        self.render_mode = render_mode
         self.current_car = 0
+        self._prev_data: CarStatePy | None = None
+        self._reward_system: RewardSystem = config.get(
+            "reward_system", DEFAULT_REWARD_SYSTEM
+        )
+
         if PolyTrackEnv._sim_worker is None:
             PolyTrackEnv._sim_worker = SimulationWorkerPy(export_string)
-            PolyTrackEnv._queue = Queue()
-            PolyTrackEnv._viewer_process = Process(
-                target=run_viewer, args=(PolyTrackEnv._queue,), daemon=True
-            )
-            PolyTrackEnv._viewer_process.start()
 
         PolyTrackEnv._sim_worker.create_car(PolyTrackEnv._last_car_id)
         self.car_id = PolyTrackEnv._last_car_id
@@ -86,6 +89,7 @@ class PolyTrackEnv(gym.Env):
     def _fibonacci_hemisphere(
         n: int, front: bool = True
     ) -> tuple[tuple[float, float, float], ...]:
+        """Distribute n directions evenly over a hemisphere using the Fibonacci lattice."""
         dirs = []
         golden = (1 + np.sqrt(5)) / 2
         for i in range(n):
@@ -102,6 +106,7 @@ class PolyTrackEnv(gym.Env):
 
     @staticmethod
     def quat_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
+        """Convert a unit quaternion to a 3x3 rotation matrix."""
         xx = x * x
         yy = y * y
         zz = z * z
@@ -123,6 +128,7 @@ class PolyTrackEnv(gym.Env):
 
     # pylint: disable=too-many-locals, too-many-statements
     def _build_obs(self, data: CarStatePy) -> np.ndarray:
+        """Pack a CarStatePy snapshot into a flat observation vector."""
         obs = np.zeros(self.observation_space.shape, dtype=np.float32)  # type: ignore
         obs[0] = data.get_speed_kmh()
         obs[1] = 1.0 if data.get_is_finishline_cp() else 0.0
@@ -188,6 +194,7 @@ class PolyTrackEnv(gym.Env):
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Reset the car and reward state, returning the initial observation."""
         super().reset(seed=seed, options=options)
 
         PolyTrackEnv._sim_worker.delete_car(self.car_id)
@@ -199,6 +206,9 @@ class PolyTrackEnv(gym.Env):
 
         data = PolyTrackEnv._sim_worker.update_car(self.car_id)
 
+        self._prev_data = None
+        self._reward_system.reset()
+
         observation = self._build_obs(data)
         info = {}
         return observation, info
@@ -206,6 +216,10 @@ class PolyTrackEnv(gym.Env):
     def step(
         self, action: np.ndarray
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        """
+        Advance the simulation by one step and return
+        (obs, reward, terminated, truncated, info).
+        """
         assert self.action_space.contains(action), "Invalid action."
 
         up = bool(action[0])
@@ -214,18 +228,18 @@ class PolyTrackEnv(gym.Env):
         left = bool(action[3])
 
         controls = PlayerControllerPy(up, right, down, left, False)
-
         PolyTrackEnv._sim_worker.set_car_controls(self.car_id, controls)
-
         data = PolyTrackEnv._sim_worker.update_car(self.car_id)
 
         observation = self._build_obs(data)
-        reward = 0.0
+        reward = self._reward_system.compute(data, self._prev_data, {})
         terminated = data.get_is_finished()
-        truncated = False
+        truncated = data.get_frames() >= MAX_FRAMES
         info = {}
 
+        self._prev_data = data
         return observation, reward, terminated, truncated, info
 
     def render(self) -> None:
+        """Rendering is handled by the viewer process; no-op here."""
         return None
