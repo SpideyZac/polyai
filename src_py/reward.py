@@ -54,3 +54,37 @@ class RewardSystem:
         """Forward reset to all stateful components."""
         for wc in self.components:
             wc.component.reset()
+
+
+class SpeedReward(RewardComponent):
+    """Reward proportional to the car's forward speed."""
+
+    def compute(
+        self, data: CarStatePy, prev_data: CarStatePy | None, info: dict[str, Any]
+    ) -> float:
+        return data.get_speed_kmh()
+
+
+class FinishReward(RewardComponent):
+    """Reward for finishing the track."""
+
+    def compute(
+        self, data: CarStatePy, prev_data: CarStatePy | None, info: dict[str, Any]
+    ) -> float:
+        return float(data.get_is_finished())
+
+
+class ApproachCheckpointReward(RewardComponent):
+    """Reward for approaching the next checkpoint."""
+
+    def compute(
+        self, data: CarStatePy, prev_data: CarStatePy | None, info: dict[str, Any]
+    ) -> float:
+        if prev_data is None:
+            return 0.0
+        last_pos = prev_data.get_position()
+        curr_pos = data.get_position()
+        cp_pos = data.get_next_checkpoint_position()
+        prev_dist_sq = (last_pos[0] - cp_pos[0]) ** 2 + (last_pos[1] - cp_pos[1]) ** 2
+        curr_dist_sq = (curr_pos[0] - cp_pos[0]) ** 2 + (curr_pos[1] - cp_pos[1]) ** 2
+        return prev_dist_sq - curr_dist_sq
