@@ -26,7 +26,6 @@ pub mod simulation_worker {
         define_stub_info_gatherer,
         derive::{gen_stub_pyclass, gen_stub_pymethods},
     };
-    use rayon::iter::{ParallelBridge, ParallelIterator};
 
     use crate::{
         MODULE, engine,
@@ -301,7 +300,6 @@ pub mod simulation_worker {
         ) -> Vec<(u32, f32)> {
             let dirs = directions.as_array();
             dirs.outer_iter()
-                .par_bridge()
                 .map(|row| {
                     let dir = [row[0], row[1], row[2]];
                     self.simulation.raycast(origin, dir, max_distance)

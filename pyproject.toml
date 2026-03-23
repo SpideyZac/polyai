@@ -16,6 +16,7 @@ dependencies = [
     "grpcio>=1.78.0",
     "gymnasium==1.2.2",
     "ray[rllib]>=2.54.0",
+    "torch>=2.10.0",
     "websockets>=16.0",
 ]
 

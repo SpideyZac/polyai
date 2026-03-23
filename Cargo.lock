@@ -3169,7 +3169,6 @@ dependencies = [
  "polytrack-codes",
  "pyo3",
  "pyo3-stub-gen",
- "rayon",
  "thiserror 2.0.18",
  "wasmtime",
  "wgpu",
