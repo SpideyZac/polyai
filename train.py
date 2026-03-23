@@ -17,6 +17,13 @@ from ray.rllib.algorithms.ppo import PPOConfig
 from ray.tune.registry import register_env
 
 from src_py.polytrack import PolyTrackEnv
+from src_py.reward import (
+    RewardSystem,
+    WeightedComponent,
+    SpeedReward,
+    ApproachCheckpointReward,
+    FinishReward,
+)
 
 CHECKPOINT_DIR = "./checkpoints"
 LOG_FILE = "./training_log.jsonl"
@@ -95,7 +102,16 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
         PPOConfig()
         .environment(
             env="PolyTrackEnv",
-            env_config={"export_string": export_string},
+            env_config={
+                "export_string": export_string,
+                "reward_system": RewardSystem(
+                    [
+                        WeightedComponent(SpeedReward(), 1.0),
+                        WeightedComponent(ApproachCheckpointReward(), 1.0),
+                        WeightedComponent(FinishReward(), 1.0),
+                    ]
+                ),
+            },
         )
         .framework("torch")
         .env_runners(
