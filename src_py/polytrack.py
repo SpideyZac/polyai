@@ -194,6 +194,14 @@ class PolyTrackEnv(gym.Env):
 
         return obs
 
+    def _build_info(self, data: CarStatePy) -> dict[str, Any]:
+        """Build an info dict from the CarStatePy data."""
+        info = {
+            "finished": int(data.get_is_finished()),
+            "checkpoints_hit": data.get_next_checkpoint_index() - 1,
+        }
+        return info
+
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -213,7 +221,7 @@ class PolyTrackEnv(gym.Env):
         self._reward_system.reset()
 
         observation = self._build_obs(data)
-        info = {}
+        info = self._build_info(data)
         return observation, info
 
     def step(
@@ -238,7 +246,7 @@ class PolyTrackEnv(gym.Env):
         reward = self._reward_system.compute(data, self._prev_data, {})
         terminated = data.get_is_finished()
         truncated = data.get_frames() >= MAX_FRAMES
-        info = {}
+        info = self._build_info(data)
 
         self._prev_data = data
         return observation, reward, terminated, truncated, info
