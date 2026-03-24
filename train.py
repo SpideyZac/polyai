@@ -8,6 +8,7 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import os
 import time
 
@@ -17,38 +18,79 @@ from ray.rllib.algorithms.ppo import PPOConfig
 from ray.tune.registry import register_env
 
 from src_py.polytrack import PolyTrackEnv
-from src_py.reward import (
-    RewardSystem,
-    WeightedComponent,
-    SpeedReward,
-    ApproachCheckpointReward,
-    FinishReward,
-)
 
+# Where checkpoints are written to disk.
 CHECKPOINT_DIR = "./checkpoints"
+# Append-only JSONL file; one dict per iteration for offline analysis.
 LOG_FILE = "./training_log.jsonl"
+# Write a checkpoint every N iterations. Checkpointing serialises model
+# weights + MeanStdFilter state so it is not free - every iteration is wasteful.
 CHECKPOINT_INTERVAL = 10
+# How often (seconds) to check whether the cluster has changed size or
+# whether learner scaling is warranted.
 REBUILD_INTERVAL = 60
+# Seconds to sleep after a caught training exception before retrying,
+# preventing a tight crash loop on a persistent failure.
 WORKER_RESTART_DELAY = 5
+# Ray cluster address. "auto" works when running on a node started with
+# `ray start --head`. Set explicitly if auto-detection is unreliable.
 RAY_ADDRESS = "auto"
 
+# CPUs reserved per rollout worker.
+# One worker per CPU outperforms fewer workers with multiple threads.
 CPUS_PER_WORKER = 1
 
+# Fraction of total iteration time spent in the learner that triggers scaling.
+# 0.4 means "if SGD takes >40% of wall time, add a learner".
 LEARN_TIME_THRESHOLD = 0.4
+# Minimum seconds between consecutive learner scale events. Prevents rapid
+# back-to-back rebuilds if the EMA stays elevated.
+SCALE_COOLDOWN = 300
+# Smoothing factor for the exponential moving average of timing metrics.
+# Higher = faster to react, lower = more stable. 0.2 is a good default.
+EMA_ALPHA = 0.2
+# Hard cap on learner workers regardless of GPU availability.
 MAX_LEARNERS = 4
+# CPUs per learner worker. Used for data loading off the GPU; more than 2
+# never helps for a flat MLP.
 CPUS_PER_LEARNER = 2
+# GPUs per learner worker. Always 1 - data-parallel multi-GPU adds all-reduce
+# overhead that exceeds compute savings at flat MLP scale.
 GPUS_PER_LEARNER = 1
 
+# -1 means Ray restarts dead rollout workers indefinitely rather than
+# crashing the run. Set to a positive integer to give up after N restarts.
 MAX_WORKER_RESTARTS = -1
 
+# Total env steps collected across all workers before one SGD phase.
+# Scale linearly with worker count: num_workers * avg_episode_length * 2.
 TRAIN_BATCH_SIZE = 50_000
+# Train batch is split into minibatches for each SGD epoch. Larger values
+# improve GPU utilisation; 1024 is appropriate for a 122-dim flat MLP.
 MINIBATCH_SIZE = 1024
+# Full passes over the train batch per iteration. PPO's clip objective bounds
+# how stale the data can be. Reduce if the policy collapses after updates.
 NUM_SGD_EPOCHS = 10
+# Bonus proportional to policy entropy, encouraging exploration. Anneal
+# toward 0 once the agent reliably reaches the first few checkpoints.
 ENTROPY_COEFF = 0.01
+# Clips the probability ratio between old and new policy to
+# [1 - CLIP_PARAM, 1 + CLIP_PARAM]. Limits update size. 0.2 is standard.
 CLIP_PARAM = 0.2
+# Clips the value function loss. Set to ~max expected undiscounted return.
 VF_CLIP_PARAM = 10.0
+# Discount factor. Higher values are needed for long episodes - at 5000
+# steps, rewards from early in the episode are near-zero at 0.99.
 GAMMA = 0.995
+# GAE lambda. Controls bias-variance tradeoff: 1.0 = Monte Carlo,
+# 0.0 = TD(0). 0.95 is the PPO default and rarely needs changing.
 LAMBDA_GAE = 0.95
+
+# Run deterministic evaluation every N training iterations.
+EVAL_INTERVAL = 10
+# Number of episodes to run per evaluation. More episodes = less noisy
+# eval signal but more wall-clock time spent not training.
+EVAL_EPISODES = 10
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,59 +101,81 @@ log = logging.getLogger(__name__)
 
 
 def log_event(data: dict) -> None:
-    """Append a JSON-encoded event to the log file."""
+    """Append a JSON-serialisable dict as one line to the JSONL log file."""
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(data) + "\n")
 
 
 def cluster_resources() -> tuple[int, int]:
-    """Return (total_cpus, total_gpus) from the current Ray cluster."""
+    """Return (total_cpus, total_gpus) from the live Ray cluster."""
     r = ray.cluster_resources()
     return int(r.get("CPU", 1)), int(r.get("GPU", 0))
 
 
 def get_num_rollout_workers(num_learners: int, total_cpus: int) -> int:
-    """Return the number of rollout workers to use, given the learner count and total CPUs."""
+    """Return how many rollout workers fit after reserving CPUs for learners."""
     reserved = num_learners * CPUS_PER_LEARNER
     return max(1, (total_cpus - reserved) // CPUS_PER_WORKER)
 
 
-def desired_num_learners(metrics: dict, current: int, total_gpus: int) -> int:
-    """Return updated learner count, scaling up by one if SGD is the bottleneck
-    and a free GPU exists."""
-    s, l = metrics["sample_time_ms"], metrics["learn_time_ms"]
-    if s != s or l != l or s <= 0:  # pylint: disable=comparison-with-itself
-        return current
-    if l / (s + l) > LEARN_TIME_THRESHOLD and total_gpus > current:
-        new = min(current + 1, MAX_LEARNERS, total_gpus)
-        if new != current:
-            log.warning(
-                "learn_time is %.0f%% of iteration time - scaling learners %d -> %d",
-                l / (s + l) * 100,
-                current,
-                new,
+class LearnerScaler:
+    """Tracks EMA of sample/learn times and decides when to scale learners up."""
+
+    def __init__(self) -> None:
+        self._ema_sample: float | None = None
+        self._ema_learn: float | None = None
+        self._last_scale_time: float = 0.0
+
+    def update(self, sample_ms: float, learn_ms: float) -> None:
+        """Ingest one iteration's timing values into the running EMA."""
+        if math.isnan(sample_ms) or math.isnan(learn_ms):
+            return
+        if self._ema_sample is None:
+            self._ema_sample = sample_ms
+            self._ema_learn = learn_ms
+        else:
+            self._ema_sample = (
+                EMA_ALPHA * sample_ms + (1 - EMA_ALPHA) * self._ema_sample
             )
-            return new
-    return current
+            # pylint: disable=line-too-long
+            self._ema_learn = EMA_ALPHA * learn_ms + (1 - EMA_ALPHA) * self._ema_learn  # type: ignore[operator]
+
+    def desired_learners(self, current: int, total_gpus: int) -> int:
+        """Return the desired learner count based on smoothed timing ratios.
+
+        Adds one learner if the EMA learn fraction exceeds LEARN_TIME_THRESHOLD
+        and a free GPU exists, subject to SCALE_COOLDOWN between scale events.
+        """
+        if self._ema_sample is None or self._ema_sample <= 0:
+            return current
+        if time.time() - self._last_scale_time < SCALE_COOLDOWN:
+            return current
+
+        ratio = self._ema_learn / (self._ema_sample + self._ema_learn)  # type: ignore[operator]
+
+        if ratio > LEARN_TIME_THRESHOLD and total_gpus > current:
+            new = min(current + 1, MAX_LEARNERS, total_gpus)
+            if new != current:
+                self._last_scale_time = time.time()
+                log.warning(
+                    "EMA learn_time %.0f%% of iteration - scaling learners %d -> %d",
+                    ratio * 100,
+                    current,
+                    new,
+                )
+                return new
+
+        return current
 
 
 def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Algorithm:
-    """Construct a new PPO trainer with the given number of learners and workers."""
+    """Construct and return a PPO Algorithm with the given worker and learner counts."""
     log.info("Building trainer - workers: %d  learners: %d", num_workers, num_learners)
     config = (
         PPOConfig()
         .environment(
             env="PolyTrackEnv",
-            env_config={
-                "export_string": export_string,
-                "reward_system": RewardSystem(
-                    [
-                        WeightedComponent(SpeedReward(), 1.0),
-                        WeightedComponent(ApproachCheckpointReward(), 1.0),
-                        WeightedComponent(FinishReward(), 1.0),
-                    ]
-                ),
-            },
+            env_config={"export_string": export_string},
         )
         .framework("torch")
         .env_runners(
@@ -145,6 +209,13 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             use_critic=True,
             use_gae=True,
         )
+        .evaluation(
+            evaluation_interval=EVAL_INTERVAL,
+            evaluation_duration=EVAL_EPISODES,
+            evaluation_duration_unit="episodes",
+            evaluation_num_env_runners=1,
+            evaluation_config={"explore": False},
+        )
         .api_stack(
             enable_rl_module_and_learner=True,
             enable_env_runner_and_connector_v2=True,
@@ -158,7 +229,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
 
 
 def save_checkpoint(trainer: Algorithm) -> str:
-    """Save a checkpoint and return its path."""
+    """Save a checkpoint and return its path as a string."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     checkpoint = trainer.save(CHECKPOINT_DIR)
     if hasattr(checkpoint, "checkpoint") and hasattr(checkpoint.checkpoint, "path"):
@@ -176,19 +247,51 @@ def restore_weights(trainer: Algorithm, checkpoint_path: str) -> None:
 
 
 def extract_metrics(result: dict) -> dict:
-    """Extract relevant metrics from the trainer result dict, with defaults."""
+    """Pull all relevant metrics out of the RLlib result dict."""
     runners = result.get("env_runners", {})
     timers = result.get("timers", {})
+    eval_runner = result.get("evaluation", {}).get("env_runners", {})
+    learner = result.get("learners", {}).get("default_policy", {})
     return {
+        # Mean episode return across all rollout workers this iteration.
         "reward_mean": runners.get("episode_reward_mean", float("nan")),
+        # Best and worst episode returns this iteration.
         "reward_max": runners.get("episode_reward_max", float("nan")),
         "reward_min": runners.get("episode_reward_min", float("nan")),
+        # Average number of steps per episode. Approaches MAX_FRAMES if the
+        # agent is not finishing; approaches 0 if it crashes immediately.
         "ep_len_mean": runners.get("episode_len_mean", float("nan")),
+        # Cumulative episode and step counts since training started.
         "episodes_total": result.get("episodes_total", 0),
         "timesteps_total": result.get("num_env_steps_sampled_lifetime", 0),
+        # Mean number of track checkpoints hit per episode. Populated when
+        # PolyTrackEnv.step() returns {"checkpoints_hit": n} in info.
         "checkpoints_hit": runners.get("checkpoints_hit_mean", float("nan")),
+        # Fraction of episodes that ended with terminated=True (reached the
+        # finish line) vs truncated (hit MAX_FRAMES). Populated when
+        # PolyTrackEnv.step() returns {"finished": 0 or 1} in info.
         "finish_rate": runners.get("finished_mean", float("nan")),
+        # Deterministic evaluation reward - cleaner signal than training
+        # reward because exploration noise is disabled.
+        "eval_reward_mean": eval_runner.get("episode_reward_mean", float("nan")),
+        # Deterministic evaluation episode length.
+        "eval_ep_len_mean": eval_runner.get("episode_len_mean", float("nan")),
+        # PPO surrogate policy loss. Should decrease over time; a sudden
+        # spike suggests the policy update was too large.
+        "policy_loss": learner.get("policy_loss", float("nan")),
+        # Value function loss. High values mean the critic is struggling to
+        # predict returns - consider raising VF_CLIP_PARAM if it stays high.
+        "vf_loss": learner.get("vf_loss", float("nan")),
+        # KL divergence between old and new policy. Values consistently
+        # above ~0.02 suggest CLIP_PARAM or NUM_SGD_EPOCHS is too large.
+        "kl": learner.get("kl", float("nan")),
+        # Policy entropy. Should start high and decay as the policy
+        # specialises. If it collapses to near zero early, raise ENTROPY_COEFF.
+        "entropy": learner.get("entropy", float("nan")),
+        # Wall time spent collecting rollouts. Should dominate learn_time
+        # for this architecture - if not, see LEARN_TIME_THRESHOLD.
         "sample_time_ms": timers.get("sample_time_ms", float("nan")),
+        # Wall time spent on SGD updates.
         "learn_time_ms": timers.get("learn_time_ms", float("nan")),
     }
 
@@ -196,21 +299,27 @@ def extract_metrics(result: dict) -> dict:
 def log_metrics(
     iteration: int, num_workers: int, num_learners: int, metrics: dict
 ) -> None:
-    """Log key metrics to console."""
+    """Write a one-line iteration summary to the console."""
     m = metrics
     log.info(
-        "[iter %04d] reward=%.2f (min=%.2f max=%.2f)  ep_len=%.0f  "
-        "episodes=%d  steps=%d  checkpoints=%.1f  finish_rate=%.2f  "
+        "[iter %04d] reward=%.2f (min=%.2f max=%.2f)  eval=%.2f  "
+        "ep_len=%.0f  episodes=%d  steps=%d  "
+        "checkpoints=%.1f  finish_rate=%.2f  "
+        "kl=%.4f  entropy=%.3f  vf_loss=%.2f  "
         "sample_ms=%.0f  learn_ms=%.0f  workers=%d  learners=%d",
         iteration,
         m["reward_mean"],
         m["reward_min"],
         m["reward_max"],
+        m["eval_reward_mean"],
         m["ep_len_mean"],
         m["episodes_total"],
         m["timesteps_total"],
         m["checkpoints_hit"],
         m["finish_rate"],
+        m["kl"],
+        m["entropy"],
+        m["vf_loss"],
         m["sample_time_ms"],
         m["learn_time_ms"],
         num_workers,
@@ -218,13 +327,13 @@ def log_metrics(
     )
 
 
-def rebuild(
+def do_rebuild(
     num_learners: int,
     num_workers: int,
     export_string: str,
     checkpoint_path: str | None,
 ) -> Algorithm:
-    """Stop the current trainer, build a fresh one, and restore weights."""
+    """Build a fresh trainer and restore weights from the last checkpoint."""
     trainer = build_trainer(num_learners, num_workers, export_string)
     if checkpoint_path:
         restore_weights(trainer, checkpoint_path)
@@ -232,7 +341,7 @@ def rebuild(
 
 
 def main() -> None:
-    """Main training loop."""
+    """Parse args, initialise Ray, then run the training loop."""
     parser = argparse.ArgumentParser(description="Train PPO on PolyTrackEnv")
     parser.add_argument("--export-string", required=True)
     parser.add_argument("--checkpoint", default=None)
@@ -248,6 +357,7 @@ def main() -> None:
     num_workers = get_num_rollout_workers(num_learners, total_cpus)
     trainer = build_trainer(num_learners, num_workers, args.export_string)
     checkpoint_path = args.checkpoint
+    scaler = LearnerScaler()
 
     if checkpoint_path:
         log.info("Resuming from: %s", checkpoint_path)
@@ -268,6 +378,7 @@ def main() -> None:
                 continue
 
             metrics = extract_metrics(result)
+            scaler.update(metrics["sample_time_ms"], metrics["learn_time_ms"])
             log_metrics(iteration, num_workers, num_learners, metrics)
             log_event(
                 {
@@ -286,9 +397,7 @@ def main() -> None:
             now = time.time()
             if now - last_rebuild_time >= REBUILD_INTERVAL:
                 new_total_cpus, new_total_gpus = cluster_resources()
-                new_learners = desired_num_learners(
-                    metrics, num_learners, new_total_gpus
-                )
+                new_learners = scaler.desired_learners(num_learners, new_total_gpus)
                 new_workers = get_num_rollout_workers(new_learners, new_total_cpus)
 
                 if new_workers != num_workers or new_learners != num_learners:
@@ -315,7 +424,7 @@ def main() -> None:
 
                     num_learners = new_learners
                     num_workers = new_workers
-                    trainer = rebuild(
+                    trainer = do_rebuild(
                         num_learners, num_workers, args.export_string, checkpoint_path
                     )
 
