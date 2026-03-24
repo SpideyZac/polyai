@@ -24,7 +24,7 @@ CHECKPOINT_DIR = "./checkpoints"
 # Append-only JSONL file; one dict per iteration for offline analysis.
 LOG_FILE = "./training_log.jsonl"
 # Write a checkpoint every N iterations. Checkpointing serialises model
-# weights + MeanStdFilter state so it is not free — every iteration is wasteful.
+# weights + MeanStdFilter state so it is not free - every iteration is wasteful.
 CHECKPOINT_INTERVAL = 10
 # How often (seconds) to check whether the cluster has changed size or
 # whether learner scaling is warranted.
@@ -38,7 +38,7 @@ RAY_ADDRESS = "auto"
 
 # CPUs reserved per rollout worker. Each worker is one Python process running
 # one env. Raycasting (BVH + glam, 65 rays, max_distance=10) is too cheap
-# per-ray for Rayon parallelism to help — thread overhead exceeds compute
+# per-ray for Rayon parallelism to help - thread overhead exceeds compute
 # savings. One worker per CPU outperforms fewer workers with multiple threads.
 CPUS_PER_WORKER = 1
 
@@ -51,7 +51,7 @@ LEARN_TIME_SCALE_DOWN_THRESHOLD = 0.15
 # Minimum seconds between any consecutive scale events (up or down).
 SCALE_COOLDOWN = 300
 # Iterations to wait before allowing any scaling decision. The EMA needs
-# time to stabilise — early measurements are noisy and can trigger premature
+# time to stabilise - early measurements are noisy and can trigger premature
 # scale events before the training signal is meaningful.
 SCALE_WARMUP_ITERATIONS = 20
 # Smoothing factor for the exponential moving average of timing metrics.
@@ -62,7 +62,7 @@ MAX_LEARNERS = 4
 # CPUs per learner worker. Used for data loading off the GPU; more than 2
 # never helps for a flat MLP.
 CPUS_PER_LEARNER = 2
-# GPUs per learner worker. Always 1 — data-parallel multi-GPU adds all-reduce
+# GPUs per learner worker. Always 1 - data-parallel multi-GPU adds all-reduce
 # overhead that exceeds compute savings at flat MLP scale.
 GPUS_PER_LEARNER = 1
 
@@ -89,7 +89,7 @@ ENTROPY_COEFF = 0.01
 CLIP_PARAM = 0.2
 # Clips the value function loss. Set to ~max expected undiscounted return.
 VF_CLIP_PARAM = 10.0
-# Discount factor. Higher values are needed for long episodes — at 5000
+# Discount factor. Higher values are needed for long episodes - at 5000
 # steps, rewards from early in the episode are near-zero at 0.99.
 GAMMA = 0.995
 # GAE lambda. Controls bias-variance tradeoff: 1.0 = Monte Carlo,
@@ -194,7 +194,7 @@ class LearnerScaler:
             if new != current:
                 self._last_scale_time = time.time()
                 log.warning(
-                    "EMA learn_time %.0f%% of iteration — scaling learners %d -> %d",
+                    "EMA learn_time %.0f%% of iteration - scaling learners %d -> %d",
                     ratio * 100,
                     current,
                     new,
@@ -205,7 +205,7 @@ class LearnerScaler:
             new = current - 1
             self._last_scale_time = time.time()
             log.info(
-                "EMA learn_time %.0f%% of iteration — scaling learners down %d -> %d",
+                "EMA learn_time %.0f%% of iteration - scaling learners down %d -> %d",
                 ratio * 100,
                 current,
                 new,
@@ -219,7 +219,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
     """Construct and return a PPO Algorithm with the given worker and learner counts."""
     train_batch_size = get_train_batch_size(num_workers)
     log.info(
-        "Building trainer — workers: %d  learners: %d  train_batch: %d",
+        "Building trainer - workers: %d  learners: %d  train_batch: %d",
         num_workers,
         num_learners,
         train_batch_size,
@@ -324,7 +324,7 @@ def extract_metrics(result: dict) -> dict:
         # finish line) vs truncated (hit MAX_FRAMES). Populated when
         # PolyTrackEnv.step() returns {"finished": 0 or 1} in info.
         "finish_rate": runners.get("finished_mean", float("nan")),
-        # Deterministic evaluation reward — cleaner signal than training
+        # Deterministic evaluation reward - cleaner signal than training
         # reward because exploration noise is disabled.
         "eval_reward_mean": eval_runner.get("episode_reward_mean", float("nan")),
         # Deterministic evaluation episode length.
@@ -333,7 +333,7 @@ def extract_metrics(result: dict) -> dict:
         # spike suggests the policy update was too large.
         "policy_loss": learner.get("policy_loss", float("nan")),
         # Value function loss. High values mean the critic is struggling to
-        # predict returns — consider raising VF_CLIP_PARAM if it stays high.
+        # predict returns - consider raising VF_CLIP_PARAM if it stays high.
         "vf_loss": learner.get("vf_loss", float("nan")),
         # KL divergence between old and new policy. Values consistently
         # above ~0.02 suggest CLIP_PARAM or NUM_SGD_EPOCHS is too large.
@@ -342,7 +342,7 @@ def extract_metrics(result: dict) -> dict:
         # specialises. If it collapses to near zero early, raise ENTROPY_COEFF.
         "entropy": learner.get("entropy", float("nan")),
         # Wall time spent collecting rollouts. Should dominate learn_time
-        # for this architecture — if not, see LEARN_TIME_SCALE_UP_THRESHOLD.
+        # for this architecture - if not, see LEARN_TIME_SCALE_UP_THRESHOLD.
         "sample_time_ms": timers.get("sample_time_ms", float("nan")),
         # Wall time spent on SGD updates.
         "learn_time_ms": timers.get("learn_time_ms", float("nan")),
@@ -459,7 +459,7 @@ def main() -> None:
 
                 if new_workers != num_workers or new_learners != num_learners:
                     log.info(
-                        "Rebuilding — workers: %d -> %d  learners: %d -> %d",
+                        "Rebuilding - workers: %d -> %d  learners: %d -> %d",
                         num_workers,
                         new_workers,
                         num_learners,
@@ -489,7 +489,7 @@ def main() -> None:
                 last_rebuild_time = now
 
     except KeyboardInterrupt:
-        log.info("Interrupted — saving final checkpoint")
+        log.info("Interrupted - saving final checkpoint")
         checkpoint_path = save_checkpoint(trainer)
         log.info("Final checkpoint: %s", checkpoint_path)
 
