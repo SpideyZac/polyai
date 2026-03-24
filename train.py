@@ -24,7 +24,7 @@ CHECKPOINT_DIR = "./checkpoints"
 # Append-only JSONL file; one dict per iteration for offline analysis.
 LOG_FILE = "./training_log.jsonl"
 # Write a checkpoint every N iterations. Checkpointing serialises model
-# weights + MeanStdFilter state so it is not free - every iteration is wasteful.
+# weights + MeanStdFilter state so it is not free — every iteration is wasteful.
 CHECKPOINT_INTERVAL = 10
 # How often (seconds) to check whether the cluster has changed size or
 # whether learner scaling is warranted.
@@ -36,16 +36,24 @@ WORKER_RESTART_DELAY = 5
 # `ray start --head`. Set explicitly if auto-detection is unreliable.
 RAY_ADDRESS = "auto"
 
-# CPUs reserved per rollout worker.
-# One worker per CPU outperforms fewer workers with multiple threads.
+# CPUs reserved per rollout worker. Each worker is one Python process running
+# one env. Raycasting (BVH + glam, 65 rays, max_distance=10) is too cheap
+# per-ray for Rayon parallelism to help — thread overhead exceeds compute
+# savings. One worker per CPU outperforms fewer workers with multiple threads.
 CPUS_PER_WORKER = 1
 
-# Fraction of total iteration time spent in the learner that triggers scaling.
+# Fraction of total iteration time spent in the learner that triggers scaling up.
 # 0.4 means "if SGD takes >40% of wall time, add a learner".
-LEARN_TIME_THRESHOLD = 0.4
-# Minimum seconds between consecutive learner scale events. Prevents rapid
-# back-to-back rebuilds if the EMA stays elevated.
+LEARN_TIME_SCALE_UP_THRESHOLD = 0.4
+# Fraction below which a learner is removed. Should be well below the scale-up
+# threshold to create a dead-band and prevent oscillation.
+LEARN_TIME_SCALE_DOWN_THRESHOLD = 0.15
+# Minimum seconds between any consecutive scale events (up or down).
 SCALE_COOLDOWN = 300
+# Iterations to wait before allowing any scaling decision. The EMA needs
+# time to stabilise — early measurements are noisy and can trigger premature
+# scale events before the training signal is meaningful.
+SCALE_WARMUP_ITERATIONS = 20
 # Smoothing factor for the exponential moving average of timing metrics.
 # Higher = faster to react, lower = more stable. 0.2 is a good default.
 EMA_ALPHA = 0.2
@@ -54,7 +62,7 @@ MAX_LEARNERS = 4
 # CPUs per learner worker. Used for data loading off the GPU; more than 2
 # never helps for a flat MLP.
 CPUS_PER_LEARNER = 2
-# GPUs per learner worker. Always 1 - data-parallel multi-GPU adds all-reduce
+# GPUs per learner worker. Always 1 — data-parallel multi-GPU adds all-reduce
 # overhead that exceeds compute savings at flat MLP scale.
 GPUS_PER_LEARNER = 1
 
@@ -62,9 +70,11 @@ GPUS_PER_LEARNER = 1
 # crashing the run. Set to a positive integer to give up after N restarts.
 MAX_WORKER_RESTARTS = -1
 
-# Total env steps collected across all workers before one SGD phase.
-# Scale linearly with worker count: num_workers * avg_episode_length * 2.
-TRAIN_BATCH_SIZE = 50_000
+# Steps per worker per batch. Train batch = num_workers * STEPS_PER_WORKER,
+# so it scales automatically when workers are added or removed. This value
+# should be at least avg_episode_length * 2 so the value function sees
+# multiple complete episodes per batch.
+STEPS_PER_WORKER = 10_000
 # Train batch is split into minibatches for each SGD epoch. Larger values
 # improve GPU utilisation; 1024 is appropriate for a 122-dim flat MLP.
 MINIBATCH_SIZE = 1024
@@ -72,14 +82,14 @@ MINIBATCH_SIZE = 1024
 # how stale the data can be. Reduce if the policy collapses after updates.
 NUM_SGD_EPOCHS = 10
 # Bonus proportional to policy entropy, encouraging exploration. Anneal
-# toward 0 once the agent reliably reaches the first few checkpoints.
+# toward 0 manually once the agent reliably reaches the first few checkpoints.
 ENTROPY_COEFF = 0.01
 # Clips the probability ratio between old and new policy to
 # [1 - CLIP_PARAM, 1 + CLIP_PARAM]. Limits update size. 0.2 is standard.
 CLIP_PARAM = 0.2
 # Clips the value function loss. Set to ~max expected undiscounted return.
 VF_CLIP_PARAM = 10.0
-# Discount factor. Higher values are needed for long episodes - at 5000
+# Discount factor. Higher values are needed for long episodes — at 5000
 # steps, rewards from early in the episode are near-zero at 0.99.
 GAMMA = 0.995
 # GAE lambda. Controls bias-variance tradeoff: 1.0 = Monte Carlo,
@@ -100,10 +110,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _sanitise(v: object) -> object:
+    """Replace float NaN with None so log lines are valid JSON."""
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
+
+
 def log_event(data: dict) -> None:
     """Append a JSON-serialisable dict as one line to the JSONL log file."""
+    sanitised = {k: _sanitise(v) for k, v in data.items()}
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(data) + "\n")
+        f.write(json.dumps(sanitised) + "\n")
 
 
 def cluster_resources() -> tuple[int, int]:
@@ -118,13 +136,27 @@ def get_num_rollout_workers(num_learners: int, total_cpus: int) -> int:
     return max(1, (total_cpus - reserved) // CPUS_PER_WORKER)
 
 
+def get_train_batch_size(num_workers: int) -> int:
+    """Return a train batch size scaled to the current worker count.
+
+    Keeps per-worker contribution constant so each worker always provides
+    a meaningful slice of the batch regardless of cluster size.
+    """
+    return max(num_workers * STEPS_PER_WORKER, MINIBATCH_SIZE)
+
+
 class LearnerScaler:
-    """Tracks EMA of sample/learn times and decides when to scale learners up."""
+    """Tracks EMA of sample/learn times and decides when to scale learners up or down."""
 
     def __init__(self) -> None:
         self._ema_sample: float | None = None
         self._ema_learn: float | None = None
         self._last_scale_time: float = 0.0
+
+    def reset(self) -> None:
+        """Clear EMA state after a rebuild so stale ratios don't drive scaling."""
+        self._ema_sample = None
+        self._ema_learn = None
 
     def update(self, sample_ms: float, learn_ms: float) -> None:
         """Ingest one iteration's timing values into the running EMA."""
@@ -140,37 +172,58 @@ class LearnerScaler:
             # pylint: disable=line-too-long
             self._ema_learn = EMA_ALPHA * learn_ms + (1 - EMA_ALPHA) * self._ema_learn  # type: ignore[operator]
 
-    def desired_learners(self, current: int, total_gpus: int) -> int:
+    def desired_learners(self, current: int, total_gpus: int, iteration: int) -> int:
         """Return the desired learner count based on smoothed timing ratios.
 
-        Adds one learner if the EMA learn fraction exceeds LEARN_TIME_THRESHOLD
-        and a free GPU exists, subject to SCALE_COOLDOWN between scale events.
+        Scales up by one when learn fraction exceeds LEARN_TIME_SCALE_UP_THRESHOLD
+        and a free GPU exists. Scales down by one when learn fraction drops below
+        LEARN_TIME_SCALE_DOWN_THRESHOLD and more than one learner is running.
+        Both directions share SCALE_COOLDOWN and SCALE_WARMUP_ITERATIONS.
         """
         if self._ema_sample is None or self._ema_sample <= 0:
+            return current
+        if iteration < SCALE_WARMUP_ITERATIONS:
             return current
         if time.time() - self._last_scale_time < SCALE_COOLDOWN:
             return current
 
         ratio = self._ema_learn / (self._ema_sample + self._ema_learn)  # type: ignore[operator]
 
-        if ratio > LEARN_TIME_THRESHOLD and total_gpus > current:
+        if ratio > LEARN_TIME_SCALE_UP_THRESHOLD and total_gpus > current:
             new = min(current + 1, MAX_LEARNERS, total_gpus)
             if new != current:
                 self._last_scale_time = time.time()
                 log.warning(
-                    "EMA learn_time %.0f%% of iteration - scaling learners %d -> %d",
+                    "EMA learn_time %.0f%% of iteration — scaling learners %d -> %d",
                     ratio * 100,
                     current,
                     new,
                 )
                 return new
 
+        if ratio < LEARN_TIME_SCALE_DOWN_THRESHOLD and current > 1:
+            new = current - 1
+            self._last_scale_time = time.time()
+            log.info(
+                "EMA learn_time %.0f%% of iteration — scaling learners down %d -> %d",
+                ratio * 100,
+                current,
+                new,
+            )
+            return new
+
         return current
 
 
 def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Algorithm:
     """Construct and return a PPO Algorithm with the given worker and learner counts."""
-    log.info("Building trainer - workers: %d  learners: %d", num_workers, num_learners)
+    train_batch_size = get_train_batch_size(num_workers)
+    log.info(
+        "Building trainer — workers: %d  learners: %d  train_batch: %d",
+        num_workers,
+        num_learners,
+        train_batch_size,
+    )
     config = (
         PPOConfig()
         .environment(
@@ -198,7 +251,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             num_gpus_per_learner=GPUS_PER_LEARNER,
         )
         .training(
-            train_batch_size=TRAIN_BATCH_SIZE,
+            train_batch_size=train_batch_size,
             minibatch_size=MINIBATCH_SIZE,
             num_epochs=NUM_SGD_EPOCHS,
             clip_param=CLIP_PARAM,
@@ -221,7 +274,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             enable_env_runner_and_connector_v2=True,
         )
         .reporting(
-            min_sample_timesteps_per_iteration=TRAIN_BATCH_SIZE,
+            min_sample_timesteps_per_iteration=train_batch_size,
             metrics_num_episodes_for_smoothing=50,
         )
     )
@@ -271,7 +324,7 @@ def extract_metrics(result: dict) -> dict:
         # finish line) vs truncated (hit MAX_FRAMES). Populated when
         # PolyTrackEnv.step() returns {"finished": 0 or 1} in info.
         "finish_rate": runners.get("finished_mean", float("nan")),
-        # Deterministic evaluation reward - cleaner signal than training
+        # Deterministic evaluation reward — cleaner signal than training
         # reward because exploration noise is disabled.
         "eval_reward_mean": eval_runner.get("episode_reward_mean", float("nan")),
         # Deterministic evaluation episode length.
@@ -280,7 +333,7 @@ def extract_metrics(result: dict) -> dict:
         # spike suggests the policy update was too large.
         "policy_loss": learner.get("policy_loss", float("nan")),
         # Value function loss. High values mean the critic is struggling to
-        # predict returns - consider raising VF_CLIP_PARAM if it stays high.
+        # predict returns — consider raising VF_CLIP_PARAM if it stays high.
         "vf_loss": learner.get("vf_loss", float("nan")),
         # KL divergence between old and new policy. Values consistently
         # above ~0.02 suggest CLIP_PARAM or NUM_SGD_EPOCHS is too large.
@@ -289,7 +342,7 @@ def extract_metrics(result: dict) -> dict:
         # specialises. If it collapses to near zero early, raise ENTROPY_COEFF.
         "entropy": learner.get("entropy", float("nan")),
         # Wall time spent collecting rollouts. Should dominate learn_time
-        # for this architecture - if not, see LEARN_TIME_THRESHOLD.
+        # for this architecture — if not, see LEARN_TIME_SCALE_UP_THRESHOLD.
         "sample_time_ms": timers.get("sample_time_ms", float("nan")),
         # Wall time spent on SGD updates.
         "learn_time_ms": timers.get("learn_time_ms", float("nan")),
@@ -360,6 +413,8 @@ def main() -> None:
     scaler = LearnerScaler()
 
     if checkpoint_path:
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         log.info("Resuming from: %s", checkpoint_path)
         restore_weights(trainer, checkpoint_path)
 
@@ -397,12 +452,14 @@ def main() -> None:
             now = time.time()
             if now - last_rebuild_time >= REBUILD_INTERVAL:
                 new_total_cpus, new_total_gpus = cluster_resources()
-                new_learners = scaler.desired_learners(num_learners, new_total_gpus)
+                new_learners = scaler.desired_learners(
+                    num_learners, new_total_gpus, iteration
+                )
                 new_workers = get_num_rollout_workers(new_learners, new_total_cpus)
 
                 if new_workers != num_workers or new_learners != num_learners:
                     log.info(
-                        "Rebuilding - workers: %d -> %d  learners: %d -> %d",
+                        "Rebuilding — workers: %d -> %d  learners: %d -> %d",
                         num_workers,
                         new_workers,
                         num_learners,
@@ -427,11 +484,12 @@ def main() -> None:
                     trainer = do_rebuild(
                         num_learners, num_workers, args.export_string, checkpoint_path
                     )
+                    scaler.reset()
 
                 last_rebuild_time = now
 
     except KeyboardInterrupt:
-        log.info("Interrupted - saving final checkpoint")
+        log.info("Interrupted — saving final checkpoint")
         checkpoint_path = save_checkpoint(trainer)
         log.info("Final checkpoint: %s", checkpoint_path)
 
