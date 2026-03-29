@@ -15,6 +15,8 @@ import time
 import ray
 from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.connectors.env_to_module import MeanStdFilter
+from ray.train import Checkpoint
 from ray.tune.registry import register_env
 
 from src_py.polytrack import PolyTrackEnv
@@ -235,15 +237,13 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             num_env_runners=num_workers,
             num_cpus_per_env_runner=CPUS_PER_WORKER,
             num_envs_per_env_runner=1,
-            create_env_on_local_worker=False,
-            observation_filter="MeanStdFilter",
+            env_to_module_connector=lambda env: MeanStdFilter(multi_agent=False),
         )
         .fault_tolerance(
             max_num_env_runner_restarts=MAX_WORKER_RESTARTS,
         )
         .resources(
-            num_gpus=0,
-            num_cpus_for_local_worker=0,
+            num_cpus_for_main_process=1,
         )
         .learners(
             num_learners=num_learners,
@@ -269,10 +269,6 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             evaluation_num_env_runners=1,
             evaluation_config={"explore": False},
         )
-        .api_stack(
-            enable_rl_module_and_learner=True,
-            enable_env_runner_and_connector_v2=True,
-        )
         .reporting(
             min_sample_timesteps_per_iteration=train_batch_size,
             metrics_num_episodes_for_smoothing=50,
@@ -285,18 +281,15 @@ def save_checkpoint(trainer: Algorithm) -> str:
     """Save a checkpoint and return its path as a string."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     checkpoint = trainer.save(CHECKPOINT_DIR)
-    if hasattr(checkpoint, "checkpoint") and hasattr(checkpoint.checkpoint, "path"):
-        return checkpoint.checkpoint.path  # type: ignore[union-attr]
+    if isinstance(checkpoint, Checkpoint):
+        return checkpoint.path
     return str(checkpoint)
 
 
 def restore_weights(trainer: Algorithm, checkpoint_path: str) -> None:
-    """Restore weights only, avoiding Algorithm.from_checkpoint() which would
-    overwrite the current config with the checkpoint's saved one."""
-    source = Algorithm.from_checkpoint(checkpoint_path)
-    trainer.set_weights(source.get_weights())
-    source.stop()
-    log.info("Weights restored from %s", checkpoint_path)
+    """Restore model weights and optimizer state from a checkpoint path."""
+    trainer.restore(checkpoint_path)
+    log.info("Full state restored from %s", checkpoint_path)
 
 
 def extract_metrics(result: dict) -> dict:
@@ -386,11 +379,12 @@ def do_rebuild(
     export_string: str,
     checkpoint_path: str | None,
 ) -> Algorithm:
-    """Build a fresh trainer and restore weights from the last checkpoint."""
-    trainer = build_trainer(num_learners, num_workers, export_string)
+    """Build a fresh trainer, restoring state from checkpoint if provided."""
     if checkpoint_path:
-        restore_weights(trainer, checkpoint_path)
-    return trainer
+        trainer = build_trainer(num_learners, num_workers, export_string)
+        trainer.restore(checkpoint_path)
+        return trainer
+    return build_trainer(num_learners, num_workers, export_string)
 
 
 def main() -> None:
