@@ -911,7 +911,7 @@ impl CarState {
         };
         let brake_light_enabled = control_byte & 32 != 0;
 
-        let is_finishline_cp = next_checkpoint_index == max_checkpoint + 1;
+        let is_finishline_cp = next_checkpoint_index == max_checkpoint + 1 || max_checkpoint == 0;
         let next_cp = if is_finishline_cp {
             let finish_parts = track_info
                 .parts

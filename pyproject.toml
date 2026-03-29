@@ -3,7 +3,7 @@ requires = ["maturin>=1.12.6,<2.0"]
 build-backend = "maturin"
 
 [tool.uv]
-cache-keys = [{file = "rust/Cargo.toml"}, {file = "**/*.rs"}]
+cache-keys = [{file = "Cargo.toml"}, {file = "**/*.rs"}]
 
 [project]
 name = "polyai"
@@ -15,6 +15,7 @@ dependencies = [
     "black>=26.3.1",
     "grpcio>=1.78.0",
     "gymnasium==1.2.2",
+    "numpy>=2.4.3",
     "ray[rllib]>=2.54.0",
     "torch>=2.10.0",
     "websockets>=16.0",

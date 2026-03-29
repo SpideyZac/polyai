@@ -7,14 +7,14 @@ import simulation_worker
 from src_py import viewer_process
 
 # pylint: disable=line-too-long
-EXPORT_STRING = "PolyTrack24pdrVdskciFE8XCb3wRMNeeewNMvHNe2G3XftlmdkmRaPuRSkZdjoSysIWv4pl4S1STwDRzKiHJBJ44eVK0lkDs4GjdNUOdkl0FmEorcHZ02TdYD1uJUV6qgwRXKwjucnL0y81hxFFHx9yNOANRKFKNfS627RCOiwqLSqIoFlBca72GYWC0GAph3jAGQtbwLcAkYThEeuF9olyBEAFh0XtTDTYWzuHpCktWNeOnLnZuqGFmva4dRuBGoHED6dZNjEIIRZnQi3pt03tqWqgE5dojDp2nTLy0KJWBW7PRI69Ol7TOmESCvFQeAOFbrxfGDd3AbV9Au1jAqVdYY3W7YRJGbqEAj05u8aNQRzmVnPkJj1iljU51pCgrLeqSY2pUtaXYcKJNeIKQYs9T2LfGeQrsUYVLT25i1IU2N3Bl8l1leqWa9Ahmk9D3UmwcQNnSBlynlISO23aJaNFjeS5gW8IMsZRsfpcE4qbRabrXIDJBNlQy7t1BCfEjwGyXJt5vZKi4LMYIM4xTlsZZHXuz8k9QEeJs9gJpIv9MVynPlZt002SGkTjkEk3U8NkhGeJuPFiv0jNS91k0LET77Mr8ImufhDgY6cfjVPkwhV7MSaMR7Z1IQcesNq4wmIYcObELODkoehQuEC9mcr6ovy3p6aXdqvDXi2dtnRcbPAfYsve3RkAYafM3mK1vkMh37PuK1XIBQezZPwtmoeUfkigd4vXUuVvhifBxn4el3ZxffRWOLmHX06B9wQBrhr8Mr3xadI2F1aPEDngAqfOgzbbHRTneH6mRhxgIldZEyi8Wc5jd2gygS0y0desgpuAyAeNMmDcLcLie5B2lzyQ1zIHQQzWF1vJjmtnfbC6UIXy6yI5zGyGyPxa9gw8E3BU0sVT9VCSCdJXhtVQcW0SRbtBeI8nKHHXfKgve2NTrheuJ4wTUmGci0Na49RGxeHZE3fMjY6k9EjbtFPLjZdKvZm6BhORyuwuWOEM1EQqSISU7ext7lwBY4JdtTVjUhtxALC37eRG3HgcqviUavOESJ2eV2ZvkpRw8y6wejYq0wHN1xCErYWzOucVFPqVFYj4ATHrW5aZPzdm7sSMHv8WyeEVdJ8fN1lsmEm19fWvLhLf9lpyecfsJBbIsISLTt5HEQYfe9keEbFMVCy1L7lLywRopov0q76br3oM0WaQqp2Yf380jZHzEeGnkMqBqBivxoHWXHSSm38jeRzvt53NWecbE51qtjqeC6m0bvmRjnO8rHDfzXtNmd38iRhPGSn5Ib19VPzBeF5SFqB5gb6T2v0KsxReMyCc7YWaDQgWfzZd1kuuE7OWSkjYGPp4bfJZnu9KpkteZjpuqweFhY2FBqHxSyYxe7ZEYAepeBIIkMetGNhgeOxaNLjve8nNlcfGHD7FsGXhIkGHBJ0HvfAUfojDoO4Hne5oQn51oeLkEz2Efdke7OyE3SoCbk50cfrzvYsY8mMmcmsVeScqj2rOfS9epl5fpQFGqjhGHVXY83C4WEB6WTHjwueP3tYLCGCZiHyc0WeEcupH1Cps0mmikCQnnfvfKG12peXnT1XNIfZEoaEy9aAeQ6ciSb4Gm0pSyR1UFqclSEBfKq5MeIySoPFFiLRcK8mztlSDeujKhYkksZ28j57oG8nmFx2siyrewpyIEvczxnW2Unyqnlt7VqvNY4zoVCfKtrrBCb7w8zjheyXMAeqo6HTRwTOhjSBSoyaf9fQCgsPOdIuMfPgaGstZ"
+EXPORT_STRING = "PolyTrack24pdDBvuCABDFAAeL1Ubf5YuEOpZOu9TlLJTI1x80z3XHIY5z83DTiAX0mbmB19KPgF4gN8CODrsPaLf4eUljkI1OO9rFj7CghGZJ5rAKbd2zpCrp4VCzlarogH9tp1fgB"
 
 
 def main():
     """Main function to run the simulation worker and viewer."""
-    queue: Queue = Queue()
-    viewer = Process(target=viewer_process.run_viewer, args=(queue,), daemon=True)
-    viewer.start()
+    # queue: Queue = Queue()
+    # viewer = Process(target=viewer_process.run_viewer, args=(queue,), daemon=True)
+    # viewer.start()
 
     # pylint: disable=no-member
     simworker = simulation_worker.SimulationWorkerPy(EXPORT_STRING)
@@ -38,30 +38,30 @@ def main():
         f"Time taken: {end_time - start_time} or in milliseconds: {(end_time - start_time) * 1000}"
     )
 
-    time.sleep(10)  # Wait for connections to establish
+    # time.sleep(10)  # Wait for connections to establish
 
-    # pylint: disable=line-too-long
-    queue.put(
-        (
-            EXPORT_STRING,
-            "eNod0E0rhFEchvHfGU3GS2OSpY2NsEA2SoRiQch7UWaEJopsmJRvYcFOKUsb2Sr5CrKgyNInsPc8_7O6u8-5r6tOUX5ee30VldrdNZmnVDDIOeMcM8sBY5xEc8gQfckEPwzw0K2WXHDT5jI54zYmDY4i7HKXNEruu4xyFZyzYNblxq2w7LMQlukYzsUwu11jg0V2mIkyyzWW4_0q26xHWE95k5E32QvsSsyzYTUU70krfxXXJdVybqwXzCTDZU_8VnQ06-SxxQungX2r5MznZJL-lNOy8oNPRvjuscRlwVT85D9tmiyr",
-            26366,
-        )
-    )
+    # # pylint: disable=line-too-long
+    # queue.put(
+    #     (
+    #         EXPORT_STRING,
+    #         "eNod0E0rhFEchvHfGU3GS2OSpY2NsEA2SoRiQch7UWaEJopsmJRvYcFOKUsb2Sr5CrKgyNInsPc8_7O6u8-5r6tOUX5ee30VldrdNZmnVDDIOeMcM8sBY5xEc8gQfckEPwzw0K2WXHDT5jI54zYmDY4i7HKXNEruu4xyFZyzYNblxq2w7LMQlukYzsUwu11jg0V2mIkyyzWW4_0q26xHWE95k5E32QvsSsyzYTUU70krfxXXJdVybqwXzCTDZU_8VnQ06-SxxQungX2r5MznZJL-lNOy8oNPRvjuscRlwVT85D9tmiyr",
+    #         26366,
+    #     )
+    # )
 
-    time.sleep(10)
+    # time.sleep(10)
 
-    # pylint: disable=line-too-long
-    queue.put(
-        (
-            EXPORT_STRING,
-            "eNod0E0rhFEchvHfGU3GS2OSpY2NsEA2SoRiQch7UWaEJopsmJRvYcFOKUsb2Sr5CrKgyNInsPc8_7O6u8-5r6tOUX5ee30VldrdNZmnVDDIOeMcM8sBY5xEc8gQfckEPwzw0K2WXHDT5jI54zYmDY4i7HKXNEruu4xyFZyzYNblxq2w7LMQlukYzsUwu11jg0V2mIkyyzWW4_0q26xHWE95k5E32QvsSsyzYTUU70krfxXXJdVybqwXzCTDZU_8VnQ06-SxxQungX2r5MznZJL-lNOy8oNPRvjuscRlwVT85D9tmiyr",
-            26366,
-        )
-    )
+    # # pylint: disable=line-too-long
+    # queue.put(
+    #     (
+    #         EXPORT_STRING,
+    #         "eNod0E0rhFEchvHfGU3GS2OSpY2NsEA2SoRiQch7UWaEJopsmJRvYcFOKUsb2Sr5CrKgyNInsPc8_7O6u8-5r6tOUX5ee30VldrdNZmnVDDIOeMcM8sBY5xEc8gQfckEPwzw0K2WXHDT5jI54zYmDY4i7HKXNEruu4xyFZyzYNblxq2w7LMQlukYzsUwu11jg0V2mIkyyzWW4_0q26xHWE95k5E32QvsSsyzYTUU70krfxXXJdVybqwXzCTDZU_8VnQ06-SxxQungX2r5MznZJL-lNOy8oNPRvjuscRlwVT85D9tmiyr",
+    #         26366,
+    #     )
+    # )
 
-    while True:
-        time.sleep(3600)
+    # while True:
+    #     time.sleep(3600)
 
 
 if __name__ == "__main__":

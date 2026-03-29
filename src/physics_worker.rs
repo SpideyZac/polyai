@@ -136,12 +136,60 @@ impl PolyTrackPhysics {
             "a",
             |mut caller: Caller<'_, HostState>,
              exc: i32,
-             _ty: i32,
+             ty: i32,
              _dtor: i32|
              -> Result<(), wasmtime::Error> {
-                eprintln!("C++ exception thrown (ptr={exc})");
+                eprintln!("C++ exception thrown (ptr={exc:#x}, typeinfo={ty:#x})");
+
+                let memory = match caller.get_export("j") {
+                    Some(Extern::Memory(m)) => m,
+                    _ => {
+                        eprintln!("WASM memory export missing");
+                        mark_exited(&mut caller, 1);
+                        bail!("C++ exception: <no memory>");
+                    }
+                };
+
+                let data = memory.data(&caller);
+
+                let message = 'msg: {
+                    if exc as usize + 8 > data.len() {
+                        break 'msg "<exc obj out of bounds>".to_string();
+                    }
+
+                    let string_ptr = u32::from_le_bytes(
+                        data[exc as usize + 4..exc as usize + 8].try_into().unwrap(),
+                    ) as usize;
+
+                    if string_ptr + 12 > data.len() {
+                        break 'msg "<string ptr out of bounds>".to_string();
+                    }
+
+                    let sso_byte = data[string_ptr + 11];
+
+                    if sso_byte & 0x01 != 0 {
+                        let len = (sso_byte >> 1) as usize;
+                        if string_ptr + len > data.len() {
+                            break 'msg "<sso string out of bounds>".to_string();
+                        }
+                        String::from_utf8_lossy(&data[string_ptr..string_ptr + len]).to_string()
+                    } else {
+                        let heap_ptr = u32::from_le_bytes(
+                            data[string_ptr..string_ptr + 4].try_into().unwrap(),
+                        ) as usize;
+                        let len = u32::from_le_bytes(
+                            data[string_ptr + 4..string_ptr + 8].try_into().unwrap(),
+                        ) as usize;
+                        if heap_ptr == 0 || heap_ptr + len > data.len() {
+                            break 'msg "<heap string out of bounds>".to_string();
+                        }
+                        String::from_utf8_lossy(&data[heap_ptr..heap_ptr + len]).to_string()
+                    }
+                };
+
+                eprintln!("C++ exception message: {}", message);
                 mark_exited(&mut caller, 1);
-                bail!("C++ exception")
+                bail!("C++ exception: {}", message);
             },
         )?;
 

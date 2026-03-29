@@ -234,16 +234,17 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
         )
         .framework("torch")
         .env_runners(
-            num_env_runners=num_workers,
+            num_env_runners=num_workers - 1, # One evaluation runner
             num_cpus_per_env_runner=CPUS_PER_WORKER,
-            num_envs_per_env_runner=1,
-            env_to_module_connector=lambda env: MeanStdFilter(multi_agent=False),
+            num_envs_per_env_runner=1,  # TBD
+            # pylint: disable=line-too-long
+            env_to_module_connector=lambda env, spaces, device: MeanStdFilter(multi_agent=False),  # type: ignore
         )
         .fault_tolerance(
             max_num_env_runner_restarts=MAX_WORKER_RESTARTS,
         )
         .resources(
-            num_cpus_for_main_process=1,
+            num_cpus_for_main_process=0,
         )
         .learners(
             num_learners=num_learners,
@@ -274,7 +275,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             metrics_num_episodes_for_smoothing=50,
         )
     )
-    return config.build()
+    return config.build_algo()
 
 
 def save_checkpoint(trainer: Algorithm) -> str:

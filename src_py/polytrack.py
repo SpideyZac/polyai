@@ -45,7 +45,7 @@ class PolyTrackEnv(gym.Env):
     """Gymnasium environment wrapping the PolyTrack simulation."""
 
     _ALL_DIRS = None
-    _sim_worker: SimulationWorkerPy
+    _sim_worker: SimulationWorkerPy | None = None
     _last_car_id: int = 0
 
     def __init__(self, config: EnvConfigDict | None = None):
@@ -64,6 +64,9 @@ class PolyTrackEnv(gym.Env):
 
         if PolyTrackEnv._sim_worker is None:
             PolyTrackEnv._sim_worker = SimulationWorkerPy(export_string)
+            PolyTrackEnv._sim_worker.init()
+            if not PolyTrackEnv._sim_worker.test_determinism():
+                raise RuntimeError("Simulation worker failed determinism test.")
 
         PolyTrackEnv._sim_worker.create_car(PolyTrackEnv._last_car_id)
         self.car_id = PolyTrackEnv._last_car_id
@@ -173,7 +176,7 @@ class PolyTrackEnv(gym.Env):
         world_dirs = self._ALL_DIRS @ rot_matrix.T
         distances = [
             r[1]
-            for r in PolyTrackEnv._sim_worker.raycast_batch(
+            for r in PolyTrackEnv._sim_worker.raycast_batch(  # type: ignore
                 origin, world_dirs, RAYCAST_MAX_DISTANCE
             )
         ]
@@ -208,14 +211,14 @@ class PolyTrackEnv(gym.Env):
         """Reset the car and reward state, returning the initial observation."""
         super().reset(seed=seed, options=options)
 
-        PolyTrackEnv._sim_worker.delete_car(self.car_id)
-        PolyTrackEnv._sim_worker.create_car(self.car_id)
+        PolyTrackEnv._sim_worker.delete_car(self.car_id)  # type: ignore
+        PolyTrackEnv._sim_worker.create_car(self.car_id)  # type: ignore
 
-        PolyTrackEnv._sim_worker.set_car_controls(
+        PolyTrackEnv._sim_worker.set_car_controls(  # type: ignore
             self.car_id, PlayerControllerPy(False, False, False, False, False)
         )
 
-        data = PolyTrackEnv._sim_worker.update_car(self.car_id)
+        data = PolyTrackEnv._sim_worker.update_car(self.car_id)  # type: ignore
 
         self._prev_data = None
         self._reward_system.reset()
@@ -239,8 +242,8 @@ class PolyTrackEnv(gym.Env):
         left = bool(action[3])
 
         controls = PlayerControllerPy(up, right, down, left, False)
-        PolyTrackEnv._sim_worker.set_car_controls(self.car_id, controls)
-        data = PolyTrackEnv._sim_worker.update_car(self.car_id)
+        PolyTrackEnv._sim_worker.set_car_controls(self.car_id, controls)  # type: ignore
+        data = PolyTrackEnv._sim_worker.update_car(self.car_id)  # type: ignore
 
         observation = self._build_obs(data)
         reward = self._reward_system.compute(data, self._prev_data, {})
