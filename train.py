@@ -16,7 +16,6 @@ import ray
 from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.connectors.env_to_module import MeanStdFilter
-from ray.train import Checkpoint
 from ray.tune.registry import register_env
 
 from src_py.polytrack import PolyTrackEnv
@@ -72,10 +71,11 @@ GPUS_PER_LEARNER = 1
 # crashing the run. Set to a positive integer to give up after N restarts.
 MAX_WORKER_RESTARTS = -1
 
-# Steps per worker per batch. Train batch = num_workers * STEPS_PER_WORKER,
-# so it scales automatically when workers are added or removed. This value
-# should be at least avg_episode_length * 2 so the value function sees
-# multiple complete episodes per batch.
+# Steps per worker per batch. Per-learner train batch = num_workers *
+# STEPS_PER_WORKER / num_learners, so total data collected per iteration
+# scales automatically when workers are added or removed. This value should
+# be at least avg_episode_length * 2 so the value function sees multiple
+# complete episodes per batch.
 STEPS_PER_WORKER = 10_000
 # Train batch is split into minibatches for each SGD epoch. Larger values
 # improve GPU utilisation; 1024 is appropriate for a 122-dim flat MLP.
@@ -138,13 +138,13 @@ def get_num_rollout_workers(num_learners: int, total_cpus: int) -> int:
     return max(1, (total_cpus - reserved) // CPUS_PER_WORKER)
 
 
-def get_train_batch_size(num_workers: int) -> int:
-    """Return a train batch size scaled to the current worker count.
+def get_train_batch_size_per_learner(num_workers: int, num_learners: int) -> int:
+    """Return per-learner train batch size scaled to current worker/learner counts.
 
-    Keeps per-worker contribution constant so each worker always provides
-    a meaningful slice of the batch regardless of cluster size.
+    Total data collected per iteration = num_learners * return value, which
+    keeps per-worker contribution constant as the cluster grows or shrinks.
     """
-    return max(num_workers * STEPS_PER_WORKER, MINIBATCH_SIZE)
+    return max(STEPS_PER_WORKER * num_workers // num_learners, MINIBATCH_SIZE)
 
 
 class LearnerScaler:
@@ -160,19 +160,17 @@ class LearnerScaler:
         self._ema_sample = None
         self._ema_learn = None
 
-    def update(self, sample_ms: float, learn_ms: float) -> None:
+    def update(self, sample_s: float, learn_s: float) -> None:
         """Ingest one iteration's timing values into the running EMA."""
-        if math.isnan(sample_ms) or math.isnan(learn_ms):
+        if math.isnan(sample_s) or math.isnan(learn_s):
             return
         if self._ema_sample is None:
-            self._ema_sample = sample_ms
-            self._ema_learn = learn_ms
+            self._ema_sample = sample_s
+            self._ema_learn = learn_s
         else:
-            self._ema_sample = (
-                EMA_ALPHA * sample_ms + (1 - EMA_ALPHA) * self._ema_sample
-            )
+            self._ema_sample = EMA_ALPHA * sample_s + (1 - EMA_ALPHA) * self._ema_sample
             # pylint: disable=line-too-long
-            self._ema_learn = EMA_ALPHA * learn_ms + (1 - EMA_ALPHA) * self._ema_learn  # type: ignore[operator]
+            self._ema_learn = EMA_ALPHA * learn_s + (1 - EMA_ALPHA) * self._ema_learn  # type: ignore[operator]
 
     def desired_learners(self, current: int, total_gpus: int, iteration: int) -> int:
         """Return the desired learner count based on smoothed timing ratios.
@@ -219,12 +217,12 @@ class LearnerScaler:
 
 def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Algorithm:
     """Construct and return a PPO Algorithm with the given worker and learner counts."""
-    train_batch_size = get_train_batch_size(num_workers)
+    batch_per_learner = get_train_batch_size_per_learner(num_workers, num_learners)
     log.info(
-        "Building trainer - workers: %d  learners: %d  train_batch: %d",
+        "Building trainer - workers: %d  learners: %d  batch_per_learner: %d",
         num_workers,
         num_learners,
-        train_batch_size,
+        batch_per_learner,
     )
     config = (
         PPOConfig()
@@ -232,9 +230,12 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             env="PolyTrackEnv",
             env_config={"export_string": export_string},
         )
-        .framework("torch")
+        .api_stack(
+            enable_rl_module_and_learner=True,
+            enable_env_runner_and_connector_v2=True,
+        )
         .env_runners(
-            num_env_runners=num_workers - 1, # One evaluation runner
+            num_env_runners=num_workers - 1,  # One evaluation runner
             num_cpus_per_env_runner=CPUS_PER_WORKER,
             num_envs_per_env_runner=1,  # TBD
             # pylint: disable=line-too-long
@@ -252,7 +253,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             num_gpus_per_learner=GPUS_PER_LEARNER,
         )
         .training(
-            train_batch_size=train_batch_size,
+            train_batch_size_per_learner=batch_per_learner,
             minibatch_size=MINIBATCH_SIZE,
             num_epochs=NUM_SGD_EPOCHS,
             clip_param=CLIP_PARAM,
@@ -268,10 +269,10 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             evaluation_duration=EVAL_EPISODES,
             evaluation_duration_unit="episodes",
             evaluation_num_env_runners=1,
-            evaluation_config={"explore": False},
+            evaluation_config=PPOConfig.overrides(explore=False),
         )
         .reporting(
-            min_sample_timesteps_per_iteration=train_batch_size,
+            min_sample_timesteps_per_iteration=batch_per_learner * num_learners,
             metrics_num_episodes_for_smoothing=50,
         )
     )
@@ -281,10 +282,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
 def save_checkpoint(trainer: Algorithm) -> str:
     """Save a checkpoint and return its path as a string."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    checkpoint = trainer.save(CHECKPOINT_DIR)
-    if isinstance(checkpoint, Checkpoint):
-        return checkpoint.path
-    return str(checkpoint)
+    return str(trainer.save(CHECKPOINT_DIR))
 
 
 def restore_weights(trainer: Algorithm, checkpoint_path: str) -> None:
@@ -294,11 +292,23 @@ def restore_weights(trainer: Algorithm, checkpoint_path: str) -> None:
 
 
 def extract_metrics(result: dict) -> dict:
-    """Pull all relevant metrics out of the RLlib result dict."""
+    """Pull all relevant metrics out of the RLlib result dict.
+
+    Timer values come from result["time_taken_this_iter_s"] (total wall time)
+    and the per-phase breakdown under result["env_runners"] and
+    result["learners"] on the new API stack. The old "timers" key with
+    "sample_time_ms" / "learn_time_ms" no longer exists.
+    """
     runners = result.get("env_runners", {})
-    timers = result.get("timers", {})
     eval_runner = result.get("evaluation", {}).get("env_runners", {})
     learner = result.get("learners", {}).get("default_policy", {})
+
+    # New API stack exposes per-phase timing under these keys (seconds).
+    # EnvRunnerGroup sampling time is recorded on the runners sub-dict;
+    # learner update time is recorded on the learners sub-dict.
+    sample_s: float = runners.get("sample_time_s", float("nan"))
+    learn_s: float = result.get("learners", {}).get("update_time_s", float("nan"))
+
     return {
         # Mean episode return across all rollout workers this iteration.
         "reward_mean": runners.get("episode_reward_mean", float("nan")),
@@ -331,15 +341,15 @@ def extract_metrics(result: dict) -> dict:
         "vf_loss": learner.get("vf_loss", float("nan")),
         # KL divergence between old and new policy. Values consistently
         # above ~0.02 suggest CLIP_PARAM or NUM_SGD_EPOCHS is too large.
-        "kl": learner.get("kl", float("nan")),
+        "kl": learner.get("mean_kl_loss", float("nan")),
         # Policy entropy. Should start high and decay as the policy
         # specialises. If it collapses to near zero early, raise ENTROPY_COEFF.
         "entropy": learner.get("entropy", float("nan")),
-        # Wall time spent collecting rollouts. Should dominate learn_time
-        # for this architecture - if not, see LEARN_TIME_SCALE_UP_THRESHOLD.
-        "sample_time_ms": timers.get("sample_time_ms", float("nan")),
-        # Wall time spent on SGD updates.
-        "learn_time_ms": timers.get("learn_time_ms", float("nan")),
+        # Wall time spent collecting rollouts (seconds). Should dominate
+        # learn_time for this architecture.
+        "sample_time_s": sample_s,
+        # Wall time spent on SGD updates (seconds).
+        "learn_time_s": learn_s,
     }
 
 
@@ -353,7 +363,7 @@ def log_metrics(
         "ep_len=%.0f  episodes=%d  steps=%d  "
         "checkpoints=%.1f  finish_rate=%.2f  "
         "kl=%.4f  entropy=%.3f  vf_loss=%.2f  "
-        "sample_ms=%.0f  learn_ms=%.0f  workers=%d  learners=%d",
+        "sample_s=%.1f  learn_s=%.1f  workers=%d  learners=%d",
         iteration,
         m["reward_mean"],
         m["reward_min"],
@@ -367,8 +377,8 @@ def log_metrics(
         m["kl"],
         m["entropy"],
         m["vf_loss"],
-        m["sample_time_ms"],
-        m["learn_time_ms"],
+        m["sample_time_s"],
+        m["learn_time_s"],
         num_workers,
         num_learners,
     )
@@ -381,11 +391,10 @@ def do_rebuild(
     checkpoint_path: str | None,
 ) -> Algorithm:
     """Build a fresh trainer, restoring state from checkpoint if provided."""
+    trainer = build_trainer(num_learners, num_workers, export_string)
     if checkpoint_path:
-        trainer = build_trainer(num_learners, num_workers, export_string)
         trainer.restore(checkpoint_path)
-        return trainer
-    return build_trainer(num_learners, num_workers, export_string)
+    return trainer
 
 
 def main() -> None:
@@ -428,7 +437,7 @@ def main() -> None:
                 continue
 
             metrics = extract_metrics(result)
-            scaler.update(metrics["sample_time_ms"], metrics["learn_time_ms"])
+            scaler.update(metrics["sample_time_s"], metrics["learn_time_s"])
             log_metrics(iteration, num_workers, num_learners, metrics)
             log_event(
                 {
