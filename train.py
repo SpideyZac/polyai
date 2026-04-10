@@ -16,6 +16,12 @@ import ray
 from ray.rllib.algorithms.algorithm import Algorithm
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.connectors.env_to_module import MeanStdFilter
+from ray.rllib.utils.metrics import (
+    ENV_RUNNER_RESULTS,
+    EVALUATION_RESULTS,
+    LEARNER_RESULTS,
+    NUM_ENV_STEPS_SAMPLED_LIFETIME,
+)
 from ray.tune.registry import register_env
 
 from src_py.polytrack import PolyTrackEnv
@@ -67,9 +73,10 @@ CPUS_PER_LEARNER = 2
 # overhead that exceeds compute savings at flat MLP scale.
 GPUS_PER_LEARNER = 1
 
-# -1 means Ray restarts dead rollout workers indefinitely rather than
-# crashing the run. Set to a positive integer to give up after N restarts.
-MAX_WORKER_RESTARTS = -1
+# True means Ray restarts dead rollout workers indefinitely. Set to a positive
+# integer to give up after N restarts, or False to never restart.
+RESTART_FAILED_ENV_RUNNERS = True
+MAX_WORKER_RESTARTS = -1  # -1 = unlimited
 
 # Steps per worker per batch. Per-learner train batch = num_workers *
 # STEPS_PER_WORKER / num_learners, so total data collected per iteration
@@ -103,6 +110,17 @@ EVAL_INTERVAL = 10
 # Number of episodes to run per evaluation. More episodes = less noisy
 # eval signal but more wall-clock time spent not training.
 EVAL_EPISODES = 10
+
+# Learner metric sub-keys (new API stack; nested under learners -> default_policy).
+# These are stable across 2.x but worth keeping in one place.
+_POLICY_LOSS_KEY = "policy_loss"
+_VF_LOSS_KEY = "vf_loss"
+_KL_KEY = "mean_kl_loss"
+_ENTROPY_KEY = "entropy"
+# New API stack reports learner update time in milliseconds under this key.
+# We convert to seconds for display and for the EMA so units are consistent
+# with sample_time_s (which is already in seconds from the env_runners dict).
+_LEARNER_UPDATE_TIMER_KEY = "learner_update_timer_ms"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -235,13 +253,13 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             enable_env_runner_and_connector_v2=True,
         )
         .env_runners(
-            num_env_runners=num_workers - 1,  # One evaluation runner
+            num_env_runners=num_workers,
             num_cpus_per_env_runner=CPUS_PER_WORKER,
-            num_envs_per_env_runner=1,  # TBD
-            # pylint: disable=line-too-long
-            env_to_module_connector=lambda env, spaces, device: MeanStdFilter(multi_agent=False),  # type: ignore
+            num_envs_per_env_runner=1,
+            env_to_module_connector=lambda env: MeanStdFilter(multi_agent=False),
         )
         .fault_tolerance(
+            restart_failed_env_runners=RESTART_FAILED_ENV_RUNNERS,
             max_num_env_runner_restarts=MAX_WORKER_RESTARTS,
         )
         .resources(
@@ -276,79 +294,83 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             metrics_num_episodes_for_smoothing=50,
         )
     )
-    return config.build_algo()
+    return config.build()
 
 
 def save_checkpoint(trainer: Algorithm) -> str:
     """Save a checkpoint and return its path as a string."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    return str(trainer.save(CHECKPOINT_DIR))
+    path = str(trainer.save_to_path(CHECKPOINT_DIR))
+    return path
 
 
 def restore_weights(trainer: Algorithm, checkpoint_path: str) -> None:
     """Restore model weights and optimizer state from a checkpoint path."""
-    trainer.restore(checkpoint_path)
+    trainer.restore_from_path(checkpoint_path)
     log.info("Full state restored from %s", checkpoint_path)
 
 
 def extract_metrics(result: dict) -> dict:
     """Pull all relevant metrics out of the RLlib result dict.
 
-    Timer values come from result["time_taken_this_iter_s"] (total wall time)
-    and the per-phase breakdown under result["env_runners"] and
-    result["learners"] on the new API stack. The old "timers" key with
-    "sample_time_ms" / "learn_time_ms" no longer exists.
-    """
-    runners = result.get("env_runners", {})
-    eval_runner = result.get("evaluation", {}).get("env_runners", {})
-    learner = result.get("learners", {}).get("default_policy", {})
+    New API stack result layout (Ray 2.x new stack):
+      result[ENV_RUNNER_RESULTS]           -> env runner aggregates
+      result[EVALUATION_RESULTS]
+            [ENV_RUNNER_RESULTS]           -> eval runner aggregates
+      result[LEARNER_RESULTS]
+            ["default_policy"]             -> per-policy learner metrics
+      result[LEARNER_RESULTS]
+            [_LEARNER_UPDATE_TIMER_KEY]    -> SGD wall time in **milliseconds**
 
-    # New API stack exposes per-phase timing under these keys (seconds).
-    # EnvRunnerGroup sampling time is recorded on the runners sub-dict;
-    # learner update time is recorded on the learners sub-dict.
+    Custom info keys (checkpoints_hit, finished) are reported by PolyTrackEnv
+    via the step() info dict. On the new API stack these surface under
+    ENV_RUNNER_RESULTS as "<key>_mean" when the env returns them consistently.
+    If they are missing (env not yet reporting them), the fallback is nan.
+    """
+    runners = result.get(ENV_RUNNER_RESULTS, {})
+    eval_runners = result.get(EVALUATION_RESULTS, {}).get(ENV_RUNNER_RESULTS, {})
+    learner_all = result.get(LEARNER_RESULTS, {})
+    # Per-policy metrics live under the policy ID key.
+    learner = learner_all.get("default_policy", {})
+
+    # Sampling wall time is in seconds (env_runners dict).
     sample_s: float = runners.get("sample_time_s", float("nan"))
-    learn_s: float = result.get("learners", {}).get("update_time_s", float("nan"))
+    learn_ms: float = learner_all.get(_LEARNER_UPDATE_TIMER_KEY, float("nan"))
+    learn_s: float = learn_ms / 1000.0 if not math.isnan(learn_ms) else float("nan")
 
     return {
         # Mean episode return across all rollout workers this iteration.
-        "reward_mean": runners.get("episode_reward_mean", float("nan")),
+        "reward_mean": runners.get("episode_return_mean", float("nan")),
         # Best and worst episode returns this iteration.
-        "reward_max": runners.get("episode_reward_max", float("nan")),
-        "reward_min": runners.get("episode_reward_min", float("nan")),
-        # Average number of steps per episode. Approaches MAX_FRAMES if the
-        # agent is not finishing; approaches 0 if it crashes immediately.
+        "reward_max": runners.get("episode_return_max", float("nan")),
+        "reward_min": runners.get("episode_return_min", float("nan")),
+        # Average number of steps per episode.
         "ep_len_mean": runners.get("episode_len_mean", float("nan")),
         # Cumulative episode and step counts since training started.
-        "episodes_total": result.get("episodes_total", 0),
-        "timesteps_total": result.get("num_env_steps_sampled_lifetime", 0),
+        "episodes_total": result.get("num_episodes_lifetime", 0),
+        "timesteps_total": result.get(NUM_ENV_STEPS_SAMPLED_LIFETIME, 0),
         # Mean number of track checkpoints hit per episode. Populated when
         # PolyTrackEnv.step() returns {"checkpoints_hit": n} in info.
+        # On the new API stack, custom info values aggregate under their key
+        # directly in ENV_RUNNER_RESULTS (not under "custom_metrics").
         "checkpoints_hit": runners.get("checkpoints_hit_mean", float("nan")),
-        # Fraction of episodes that ended with terminated=True (reached the
-        # finish line) vs truncated (hit MAX_FRAMES). Populated when
-        # PolyTrackEnv.step() returns {"finished": 0 or 1} in info.
+        # Fraction of episodes that ended with terminated=True.
         "finish_rate": runners.get("finished_mean", float("nan")),
-        # Deterministic evaluation reward - cleaner signal than training
-        # reward because exploration noise is disabled.
-        "eval_reward_mean": eval_runner.get("episode_reward_mean", float("nan")),
+        # Deterministic evaluation reward.
+        "eval_reward_mean": eval_runners.get("episode_return_mean", float("nan")),
         # Deterministic evaluation episode length.
-        "eval_ep_len_mean": eval_runner.get("episode_len_mean", float("nan")),
-        # PPO surrogate policy loss. Should decrease over time; a sudden
-        # spike suggests the policy update was too large.
-        "policy_loss": learner.get("policy_loss", float("nan")),
-        # Value function loss. High values mean the critic is struggling to
-        # predict returns - consider raising VF_CLIP_PARAM if it stays high.
-        "vf_loss": learner.get("vf_loss", float("nan")),
-        # KL divergence between old and new policy. Values consistently
-        # above ~0.02 suggest CLIP_PARAM or NUM_SGD_EPOCHS is too large.
-        "kl": learner.get("mean_kl_loss", float("nan")),
-        # Policy entropy. Should start high and decay as the policy
-        # specialises. If it collapses to near zero early, raise ENTROPY_COEFF.
-        "entropy": learner.get("entropy", float("nan")),
-        # Wall time spent collecting rollouts (seconds). Should dominate
-        # learn_time for this architecture.
+        "eval_ep_len_mean": eval_runners.get("episode_len_mean", float("nan")),
+        # PPO surrogate policy loss.
+        "policy_loss": learner.get(_POLICY_LOSS_KEY, float("nan")),
+        # Value function loss.
+        "vf_loss": learner.get(_VF_LOSS_KEY, float("nan")),
+        # KL divergence between old and new policy.
+        "kl": learner.get(_KL_KEY, float("nan")),
+        # Policy entropy.
+        "entropy": learner.get(_ENTROPY_KEY, float("nan")),
+        # Wall time spent collecting rollouts (seconds).
         "sample_time_s": sample_s,
-        # Wall time spent on SGD updates (seconds).
+        # Wall time spent on SGD updates (seconds, converted from ms above).
         "learn_time_s": learn_s,
     }
 
@@ -393,7 +415,7 @@ def do_rebuild(
     """Build a fresh trainer, restoring state from checkpoint if provided."""
     trainer = build_trainer(num_learners, num_workers, export_string)
     if checkpoint_path:
-        trainer.restore(checkpoint_path)
+        trainer.restore_from_path(checkpoint_path)
     return trainer
 
 
