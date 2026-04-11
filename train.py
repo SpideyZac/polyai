@@ -6,10 +6,12 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import logging
 import math
 import os
+import shutil
 import time
 
 import ray
@@ -26,100 +28,47 @@ from ray.tune.registry import register_env
 
 from src_py.polytrack import PolyTrackEnv
 
-# Where checkpoints are written to disk.
 CHECKPOINT_DIR = "./checkpoints"
-# Append-only JSONL file; one dict per iteration for offline analysis.
 LOG_FILE = "./training_log.jsonl"
-# Write a checkpoint every N iterations. Checkpointing serialises model
-# weights + MeanStdFilter state so it is not free - every iteration is wasteful.
-CHECKPOINT_INTERVAL = 10
-# How often (seconds) to check whether the cluster has changed size or
-# whether learner scaling is warranted.
-REBUILD_INTERVAL = 60
-# Seconds to sleep after a caught training exception before retrying,
-# preventing a tight crash loop on a persistent failure.
-WORKER_RESTART_DELAY = 5
-# Ray cluster address. "auto" works when running on a node started with
-# `ray start --head`. Set explicitly if auto-detection is unreliable.
+
+CHECKPOINT_INTERVAL_S = 1200
+MAX_CHECKPOINTS_TO_KEEP = 3
+
 RAY_ADDRESS = "auto"
 
-# CPUs reserved per rollout worker. Each worker is one Python process running
-# one env. Raycasting (BVH + glam, 65 rays, max_distance=10) is too cheap
-# per-ray for Rayon parallelism to help - thread overhead exceeds compute
-# savings. One worker per CPU outperforms fewer workers with multiple threads.
-CPUS_PER_WORKER = 1
+REBUILD_INTERVAL = 300
+WORKER_RESTART_DELAY = 10
 
-# Fraction of total iteration time spent in the learner that triggers scaling up.
-# 0.4 means "if SGD takes >40% of wall time, add a learner".
-LEARN_TIME_SCALE_UP_THRESHOLD = 0.4
-# Fraction below which a learner is removed. Should be well below the scale-up
-# threshold to create a dead-band and prevent oscillation.
-LEARN_TIME_SCALE_DOWN_THRESHOLD = 0.15
-# Minimum seconds between any consecutive scale events (up or down).
-SCALE_COOLDOWN = 300
-# Iterations to wait before allowing any scaling decision. The EMA needs
-# time to stabilise - early measurements are noisy and can trigger premature
-# scale events before the training signal is meaningful.
-SCALE_WARMUP_ITERATIONS = 20
-# Smoothing factor for the exponential moving average of timing metrics.
-# Higher = faster to react, lower = more stable. 0.2 is a good default.
-EMA_ALPHA = 0.2
-# Hard cap on learner workers regardless of GPU availability.
-MAX_LEARNERS = 4
-# CPUs per learner worker. Used for data loading off the GPU; more than 2
-# never helps for a flat MLP.
+CPUS_PER_WORKER = 1
 CPUS_PER_LEARNER = 2
-# GPUs per learner worker. Always 1 - data-parallel multi-GPU adds all-reduce
-# overhead that exceeds compute savings at flat MLP scale.
 GPUS_PER_LEARNER = 1
 
-# True means Ray restarts dead rollout workers indefinitely. Set to a positive
-# integer to give up after N restarts, or False to never restart.
+MAX_LEARNERS = 4
 RESTART_FAILED_ENV_RUNNERS = True
-MAX_WORKER_RESTARTS = -1  # -1 = unlimited
+MAX_WORKER_RESTARTS = -1
 
-# Steps per worker per batch. Per-learner train batch = num_workers *
-# STEPS_PER_WORKER / num_learners, so total data collected per iteration
-# scales automatically when workers are added or removed. This value should
-# be at least avg_episode_length * 2 so the value function sees multiple
-# complete episodes per batch.
-STEPS_PER_WORKER = 10_000
-# Train batch is split into minibatches for each SGD epoch. Larger values
-# improve GPU utilisation; 1024 is appropriate for a 122-dim flat MLP.
-MINIBATCH_SIZE = 1024
-# Full passes over the train batch per iteration. PPO's clip objective bounds
-# how stale the data can be. Reduce if the policy collapses after updates.
-NUM_SGD_EPOCHS = 10
-# Bonus proportional to policy entropy, encouraging exploration. Anneal
-# toward 0 manually once the agent reliably reaches the first few checkpoints.
-ENTROPY_COEFF = 0.01
-# Clips the probability ratio between old and new policy to
-# [1 - CLIP_PARAM, 1 + CLIP_PARAM]. Limits update size. 0.2 is standard.
+LEARN_TIME_SCALE_UP_THRESHOLD = 0.35
+LEARN_TIME_SCALE_DOWN_THRESHOLD = 0.12
+SCALE_COOLDOWN = 600
+SCALE_WARMUP_ITERATIONS = 50
+
+EMA_ALPHA = 0.15
+STEPS_PER_WORKER = 20_000
+MINIBATCH_SIZE = 2048
+NUM_SGD_EPOCHS = 15
+ENTROPY_COEFF = 0.005
 CLIP_PARAM = 0.2
-# Clips the value function loss. Set to ~max expected undiscounted return.
-VF_CLIP_PARAM = 10.0
-# Discount factor. Higher values are needed for long episodes - at 5000
-# steps, rewards from early in the episode are near-zero at 0.99.
-GAMMA = 0.995
-# GAE lambda. Controls bias-variance tradeoff: 1.0 = Monte Carlo,
-# 0.0 = TD(0). 0.95 is the PPO default and rarely needs changing.
+VF_CLIP_PARAM = 50.0
+GAMMA = 0.999
 LAMBDA_GAE = 0.95
 
-# Run deterministic evaluation every N training iterations.
-EVAL_INTERVAL = 10
-# Number of episodes to run per evaluation. More episodes = less noisy
-# eval signal but more wall-clock time spent not training.
-EVAL_EPISODES = 10
+EVAL_INTERVAL = 50
+EVAL_EPISODES = 5
 
-# Learner metric sub-keys (new API stack; nested under learners -> default_policy).
-# These are stable across 2.x but worth keeping in one place.
 _POLICY_LOSS_KEY = "policy_loss"
 _VF_LOSS_KEY = "vf_loss"
 _KL_KEY = "mean_kl_loss"
 _ENTROPY_KEY = "entropy"
-# New API stack reports learner update time in milliseconds under this key.
-# We convert to seconds for display and for the EMA so units are consistent
-# with sample_time_s (which is already in seconds from the env_runners dict).
 _LEARNER_UPDATE_TIMER_KEY = "learner_update_timer_ms"
 
 logging.basicConfig(
@@ -157,16 +106,32 @@ def get_num_rollout_workers(num_learners: int, total_cpus: int) -> int:
 
 
 def get_train_batch_size_per_learner(num_workers: int, num_learners: int) -> int:
-    """Return per-learner train batch size scaled to current worker/learner counts.
-
-    Total data collected per iteration = num_learners * return value, which
-    keeps per-worker contribution constant as the cluster grows or shrinks.
-    """
+    """Return per-learner train batch size scaled to worker/learner counts."""
     return max(STEPS_PER_WORKER * num_workers // num_learners, MINIBATCH_SIZE)
 
 
+def rotate_checkpoints(latest_path: str) -> None:
+    """Delete old checkpoints, keeping only MAX_CHECKPOINTS_TO_KEEP most recent.
+
+    Ray saves each checkpoint as a directory. We sort by name (which is
+    lexicographically equivalent to chronological order given zero-padded
+    iteration numbers) and delete the oldest once we exceed the cap.
+    """
+    pattern = os.path.join(CHECKPOINT_DIR, "checkpoint_*")
+    all_checkpoints = sorted(glob.glob(pattern))
+    # Never delete the checkpoint we just wrote, even if glob is stale.
+    candidates = [c for c in all_checkpoints if c != latest_path]
+    while len(candidates) >= MAX_CHECKPOINTS_TO_KEEP:
+        oldest = candidates.pop(0)
+        try:
+            shutil.rmtree(oldest)
+            log.info("Rotated out old checkpoint: %s", oldest)
+        except OSError as e:
+            log.warning("Failed to delete old checkpoint %s: %s", oldest, e)
+
+
 class LearnerScaler:
-    """Tracks EMA of sample/learn times and decides when to scale learners up or down."""
+    """Tracks EMA of sample/learn times and decides when to scale learners."""
 
     def __init__(self) -> None:
         self._ema_sample: float | None = None
@@ -191,13 +156,7 @@ class LearnerScaler:
             self._ema_learn = EMA_ALPHA * learn_s + (1 - EMA_ALPHA) * self._ema_learn  # type: ignore[operator]
 
     def desired_learners(self, current: int, total_gpus: int, iteration: int) -> int:
-        """Return the desired learner count based on smoothed timing ratios.
-
-        Scales up by one when learn fraction exceeds LEARN_TIME_SCALE_UP_THRESHOLD
-        and a free GPU exists. Scales down by one when learn fraction drops below
-        LEARN_TIME_SCALE_DOWN_THRESHOLD and more than one learner is running.
-        Both directions share SCALE_COOLDOWN and SCALE_WARMUP_ITERATIONS.
-        """
+        """Return the desired learner count based on smoothed timing ratios."""
         if self._ema_sample is None or self._ema_sample <= 0:
             return current
         if iteration < SCALE_WARMUP_ITERATIONS:
@@ -291,16 +250,20 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
         )
         .reporting(
             min_sample_timesteps_per_iteration=batch_per_learner * num_learners,
-            metrics_num_episodes_for_smoothing=50,
+            # Raised from 50 to 100: with long episodes there are fewer
+            # episodes per iteration, so a wider window is needed to smooth
+            # the reward curve to a readable signal.
+            metrics_num_episodes_for_smoothing=100,
         )
     )
     return config.build()
 
 
 def save_checkpoint(trainer: Algorithm) -> str:
-    """Save a checkpoint and return its path as a string."""
+    """Save a checkpoint, rotate old ones, and return the new path."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     path = str(trainer.save_to_path(CHECKPOINT_DIR))
+    rotate_checkpoints(path)
     return path
 
 
@@ -313,64 +276,41 @@ def restore_weights(trainer: Algorithm, checkpoint_path: str) -> None:
 def extract_metrics(result: dict) -> dict:
     """Pull all relevant metrics out of the RLlib result dict.
 
-    New API stack result layout (Ray 2.x new stack):
-      result[ENV_RUNNER_RESULTS]           -> env runner aggregates
-      result[EVALUATION_RESULTS]
-            [ENV_RUNNER_RESULTS]           -> eval runner aggregates
-      result[LEARNER_RESULTS]
-            ["default_policy"]             -> per-policy learner metrics
-      result[LEARNER_RESULTS]
-            [_LEARNER_UPDATE_TIMER_KEY]    -> SGD wall time in **milliseconds**
-
-    Custom info keys (checkpoints_hit, finished) are reported by PolyTrackEnv
-    via the step() info dict. On the new API stack these surface under
-    ENV_RUNNER_RESULTS as "<key>_mean" when the env returns them consistently.
-    If they are missing (env not yet reporting them), the fallback is nan.
+    New API stack result layout:
+      result[ENV_RUNNER_RESULTS]                          env runner aggregates
+      result[EVALUATION_RESULTS][ENV_RUNNER_RESULTS]      eval runner aggregates
+      result[LEARNER_RESULTS]["default_policy"]           per-policy learner metrics
+      result[LEARNER_RESULTS][_LEARNER_UPDATE_TIMER_KEY]  SGD wall time (milliseconds)
     """
     runners = result.get(ENV_RUNNER_RESULTS, {})
     eval_runners = result.get(EVALUATION_RESULTS, {}).get(ENV_RUNNER_RESULTS, {})
     learner_all = result.get(LEARNER_RESULTS, {})
-    # Per-policy metrics live under the policy ID key.
     learner = learner_all.get("default_policy", {})
 
-    # Sampling wall time is in seconds (env_runners dict).
     sample_s: float = runners.get("sample_time_s", float("nan"))
+    # Learner update time arrives in milliseconds; convert to seconds so the
+    # EMA and log output are consistent with sample_time_s.
     learn_ms: float = learner_all.get(_LEARNER_UPDATE_TIMER_KEY, float("nan"))
     learn_s: float = learn_ms / 1000.0 if not math.isnan(learn_ms) else float("nan")
 
     return {
-        # Mean episode return across all rollout workers this iteration.
         "reward_mean": runners.get("episode_return_mean", float("nan")),
-        # Best and worst episode returns this iteration.
         "reward_max": runners.get("episode_return_max", float("nan")),
         "reward_min": runners.get("episode_return_min", float("nan")),
-        # Average number of steps per episode.
         "ep_len_mean": runners.get("episode_len_mean", float("nan")),
-        # Cumulative episode and step counts since training started.
         "episodes_total": result.get("num_episodes_lifetime", 0),
         "timesteps_total": result.get(NUM_ENV_STEPS_SAMPLED_LIFETIME, 0),
-        # Mean number of track checkpoints hit per episode. Populated when
-        # PolyTrackEnv.step() returns {"checkpoints_hit": n} in info.
-        # On the new API stack, custom info values aggregate under their key
-        # directly in ENV_RUNNER_RESULTS (not under "custom_metrics").
+        # Custom info keys from PolyTrackEnv.step(); surface directly in
+        # ENV_RUNNER_RESULTS on the new API stack (not under "custom_metrics").
         "checkpoints_hit": runners.get("checkpoints_hit_mean", float("nan")),
-        # Fraction of episodes that ended with terminated=True.
         "finish_rate": runners.get("finished_mean", float("nan")),
-        # Deterministic evaluation reward.
         "eval_reward_mean": eval_runners.get("episode_return_mean", float("nan")),
-        # Deterministic evaluation episode length.
         "eval_ep_len_mean": eval_runners.get("episode_len_mean", float("nan")),
-        # PPO surrogate policy loss.
         "policy_loss": learner.get(_POLICY_LOSS_KEY, float("nan")),
-        # Value function loss.
         "vf_loss": learner.get(_VF_LOSS_KEY, float("nan")),
-        # KL divergence between old and new policy.
         "kl": learner.get(_KL_KEY, float("nan")),
-        # Policy entropy.
         "entropy": learner.get(_ENTROPY_KEY, float("nan")),
-        # Wall time spent collecting rollouts (seconds).
         "sample_time_s": sample_s,
-        # Wall time spent on SGD updates (seconds, converted from ms above).
         "learn_time_s": learn_s,
     }
 
@@ -435,7 +375,7 @@ def main() -> None:
     num_learners = 1
     num_workers = get_num_rollout_workers(num_learners, total_cpus)
     trainer = build_trainer(num_learners, num_workers, args.export_string)
-    checkpoint_path = args.checkpoint
+    checkpoint_path: str | None = args.checkpoint
     scaler = LearnerScaler()
 
     if checkpoint_path:
@@ -445,6 +385,7 @@ def main() -> None:
         restore_weights(trainer, checkpoint_path)
 
     last_rebuild_time = time.time()
+    last_checkpoint_time = time.time()
     iteration = 0
 
     try:
@@ -471,11 +412,15 @@ def main() -> None:
                 }
             )
 
-            if iteration % CHECKPOINT_INTERVAL == 0:
+            now = time.time()
+
+            # Time-based checkpointing: save if enough wall time has passed.
+            if now - last_checkpoint_time >= CHECKPOINT_INTERVAL_S:
                 checkpoint_path = save_checkpoint(trainer)
+                last_checkpoint_time = now
                 log.info("[iter %04d] checkpoint -> %s", iteration, checkpoint_path)
 
-            now = time.time()
+            # Cluster resize / learner scaling check.
             if now - last_rebuild_time >= REBUILD_INTERVAL:
                 new_total_cpus, new_total_gpus = cluster_resources()
                 new_learners = scaler.desired_learners(
@@ -502,7 +447,11 @@ def main() -> None:
                         }
                     )
 
+                    # Always checkpoint before a rebuild, regardless of the
+                    # time-based interval - a rebuild is a natural safe point
+                    # and the new trainer starts from a clean state.
                     checkpoint_path = save_checkpoint(trainer)
+                    last_checkpoint_time = now
                     trainer.stop()
 
                     num_learners = new_learners
