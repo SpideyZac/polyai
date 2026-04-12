@@ -256,7 +256,7 @@ def build_trainer(num_learners: int, num_workers: int, export_string: str) -> Al
             metrics_num_episodes_for_smoothing=100,
         )
     )
-    return config.build()
+    return config.build_algo()
 
 
 def save_checkpoint(trainer: Algorithm) -> str:
