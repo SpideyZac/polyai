@@ -3,3 +3,6 @@ target/
 .venv/
 
 __pycache__/
+
+privatekey
+publickey
